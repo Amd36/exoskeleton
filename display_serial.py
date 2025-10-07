@@ -6,7 +6,7 @@ from DataLogger import DataLogger
 # SERIAL_PORT = '/dev/ttyUSB0'  # ubuntu
 SERIAL_PORT = 'COM5'  # windows
 BAUD_RATE = 115200
-NUM_CH = 2
+NUM_CH = 8
 SAMPLES_PER_EVENT = 2  # ESP prints up to 2 rows per event
 BUFFER_LEN = 20000  # keep a large buffer to avoid data loss (20k samples)
 

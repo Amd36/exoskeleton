@@ -20,8 +20,8 @@ TaskHandle_t samplingTaskHandle = NULL;
 
 // Circular FIFO buffer: 50 rows x 10 channels
 constexpr size_t NUM_ROWS = 50;
-// constexpr size_t NUM_CH = 8;
-constexpr size_t NUM_CH = 2; 
+constexpr size_t NUM_CH = 8;
+// constexpr size_t NUM_CH = 2; 
 using sample_t = uint16_t; // ADC values
 static sample_t buffer[NUM_ROWS][NUM_CH];
 static size_t buf_head = 0; // next write index
@@ -41,8 +41,8 @@ void samplingTask(void* pvParameters) {
     // Read NUM_CH ADC channels (use analogRead on pins A0.. as configured)
     sample_t row[NUM_CH];
     // Map channels to pins — adjust these pin constants as needed for your hardware
-    // const int chPins[NUM_CH] = {34, 35, 36, 39, 32, 33, 25, 26};
-    const int chPins[NUM_CH] = {36, 39}; // --- IGNORE ---
+    const int chPins[NUM_CH] = {34, 35, 36, 39, 32, 33, 25, 26};
+    // const int chPins[NUM_CH] = {36, 39}; // --- IGNORE ---
     for (size_t i = 0; i < NUM_CH; ++i) {
       row[i] = static_cast<sample_t>(analogRead(chPins[i]));
     }
