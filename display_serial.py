@@ -1,74 +1,161 @@
 import serial
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import re
+import threading
+import queue
+from collections import deque
 
 # === CONFIGURATION ===
 SERIAL_PORT = '/dev/ttyUSB0'  # adjust to your port
 BAUD_RATE = 115200
+NUM_CH = 2
+SAMPLES_PER_EVENT = 2  # ESP prints up to 2 rows per event
+BUFFER_LEN = 20000  # keep a large buffer to avoid data loss (20k samples)
 
-# === INITIALIZE ===
-ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+# Thread-safe queue to receive parsed rows from the reader thread
+row_queue = queue.Queue(maxsize=10000)
 
-# Data buffers (hold last 1000 samples for each channel)
-channel1_data = [0] * 1000
-channel2_data = [0] * 1000
-channel3_data = [0] * 1000
+# Data buffers: one deque per channel for efficient append/pop from left
+channels = [deque([0] * BUFFER_LEN, maxlen=BUFFER_LEN) for _ in range(NUM_CH)]
 
-# === SETUP PLOT ===
-fig, ax = plt.subplots()
-line1, = ax.plot([], [], label='Channel 1')
-line2, = ax.plot([], [], label='Channel 2')
-line3, = ax.plot([], [], label='Channel 3')
-ax.set_xlim(0, 1000)
-ax.set_ylim(0, 1050)
-ax.set_title("ESP32 3-Channel ADC Real-Time")
-ax.set_xlabel("Sample")
-ax.set_ylabel("ADC Value")
-ax.legend()
+# Reader control
+reader_thread = None
+reader_stop = threading.Event()
 
 def init():
-    line1.set_data([], [])
-    line2.set_data([], [])
-    line3.set_data([], [])
-    return line1, line2, line3
+    for ln in lines:
+        ln.set_data([], [])
+    return tuple(lines)
+
+def parse_line(line):
+    """Parse a CSV or space-separated line into a list of ints. Returns None on parse error."""
+    # allow commas and/or whitespace as separators
+    line = line.strip()
+    if not line:
+        return None
+    if line == "<no-data>":
+        return None
+    parts = re.split('[,\s]+', line)
+    try:
+        vals = list(map(int, parts))
+    except ValueError:
+        print(f"Warning: non-integer in line: {line}")
+        return None
+    if len(vals) != NUM_CH:
+        print(f"Warning: expected {NUM_CH} values, got {len(vals)}: {line}")
+        return None
+    return vals
+
+def read_event():
+    # Deprecated in threaded mode; kept for compatibility but we won't use it when reader thread runs.
+    rows = []
+    for _ in range(SAMPLES_PER_EVENT):
+        try:
+            rows.append(row_queue.get_nowait())
+        except queue.Empty:
+            break
+    return rows
+
+
+def serial_reader(port, baud, timeout=0.05):
+    """Background thread that reads serial, parses lines, and pushes rows into row_queue."""
+    try:
+        s = serial.Serial(port, baud, timeout=timeout)
+    except Exception as e:
+        print(f"Serial reader failed to open {port}: {e}")
+        return
+
+    while not reader_stop.is_set():
+        try:
+            raw = s.readline()
+            if not raw:
+                continue
+            line = raw.decode('utf-8', errors='replace').strip()
+            parsed = parse_line(line)
+            if parsed is None:
+                continue
+            # push parsed row into queue, drop if full to avoid blocking
+            try:
+                row_queue.put_nowait(parsed)
+            except queue.Full:
+                # Queue full: drop oldest in queue then put (best-effort)
+                try:
+                    _ = row_queue.get_nowait()
+                    row_queue.put_nowait(parsed)
+                except queue.Empty:
+                    pass
+        except Exception as e:
+            print("Serial reader error:", e)
+            continue
+    s.close()
 
 def update(frame):
-    global channel1_data, channel2_data, channel3_data
+    # Drain the queue as fast as possible and append to channel buffers
     try:
-        line_in = ser.readline().decode('utf-8').strip()
-        data_strs = line_in.split()
-        if len(data_strs) != 3000:
-            print(f"Warning: Expected 3000 values, got {len(data_strs)}")
-            return line1, line2, line3
-        
-        flat_data = list(map(int, data_strs))
-        
-        # Split into channels
-        ch1 = flat_data[0::3]
-        ch2 = flat_data[1::3]
-        ch3 = flat_data[2::3]
+        drained = 0
+        while True:
+            try:
+                row = row_queue.get_nowait()
+            except queue.Empty:
+                break
+            for c in range(NUM_CH):
+                channels[c].append(row[c])
+            drained += 1
 
-        # Keep only latest 1000 samples
-        channel1_data = ch1[-1000:]
-        channel2_data = ch2[-1000:]
-        channel3_data = ch3[-1000:]
+        if drained == 0:
+            if 'lines' in globals() and lines is not None:
+                return tuple(lines)
+            return ()
 
-        # === WRITE TO .dat files ===
-        with open("channel1.dat", "w") as f:
-            f.write("\n".join(map(str, channel1_data)))
-        with open("channel2.dat", "w") as f:
-            f.write("\n".join(map(str, channel2_data)))
-        with open("channel3.dat", "w") as f:
-            f.write("\n".join(map(str, channel3_data)))
-
-        # === UPDATE PLOT ===
-        line1.set_data(range(1000), channel1_data)
-        line2.set_data(range(1000), channel2_data)
-        line3.set_data(range(1000), channel3_data)
+        # For plotting we downsample if buffer is large to reduce plotting cost.
+        buf_len = len(channels[0])
+        max_plot_points = 2000  # cap points shown for performance
+        step = max(1, buf_len // max_plot_points)
+        x = range(0, buf_len, step)
+        for c in range(NUM_CH):
+            y = list(channels[c])[::step]
+            lines[c].set_data(x, y)
 
     except Exception as e:
-        print("Error reading line:", e)
-    return line1, line2, line3
+        print("Error in update:", e)
+    if 'lines' in globals() and lines is not None:
+        return tuple(lines)
+    return ()
 
-ani = animation.FuncAnimation(fig, update, init_func=init, blit=True, interval=10)
-plt.show()
+if __name__ == "__main__":
+    # === INITIALIZE SERIAL ===
+    try:
+        # We create a lightweight serial here only for compatibility; the reader thread opens its own serial.
+        ser = None
+    except Exception:
+        ser = None
+
+    # === SETUP PLOT ===
+    fig, ax = plt.subplots(figsize=(10, 6))
+    lines = []
+    for ch in range(NUM_CH):
+        ln, = ax.plot([], [], label=f'Channel {ch+1}')
+        lines.append(ln)
+    ax.set_xlim(0, BUFFER_LEN)
+    ax.set_ylim(0, 4095)
+    ax.set_title(f"ESP32 {NUM_CH}-Channel ADC Real-Time")
+    ax.set_xlabel("Sample")
+    ax.set_ylabel("ADC Value")
+    ax.legend(loc='upper right')
+
+    # Start reader thread
+    reader_stop.clear()
+    reader_thread = threading.Thread(target=serial_reader, args=(SERIAL_PORT, BAUD_RATE), daemon=True)
+    reader_thread.start()
+
+    # Animation interval controls UI refresh; keep it modest (e.g., 50 ms) while the reader handles high-rate IO.
+    ani = animation.FuncAnimation(fig, update, init_func=init, blit=False, interval=50)
+
+    try:
+        plt.show()
+    finally:
+        # stop reader thread on exit
+        reader_stop.set()
+        if reader_thread is not None:
+            reader_thread.join(timeout=0.5)
