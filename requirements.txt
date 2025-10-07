@@ -1,0 +1,17 @@
+# Requirements for MMG Signal Processing and Real-time Data Acquisition
+# Compatible with Python 3.10
+
+# Core scientific computing
+numpy>=1.21.0,<2.0.0
+scipy>=1.7.0,<2.0.0
+matplotlib>=3.5.0,<4.0.0
+
+# Serial communication for real-time data acquisition
+pyserial>=3.5,<4.0
+
+# Optional: Jupyter notebook support (if you plan to run notebooks)
+jupyter>=1.0.0,<2.0.0
+ipykernel>=6.15.0,<7.0.0
+
+# Optional: Additional useful packages for data analysis
+pandas>=1.3.0,<3.0.0
