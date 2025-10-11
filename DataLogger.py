@@ -44,13 +44,13 @@ class DataLogger:
         
     def parse_line(self, line):
         """
-        Parse a CSV or space-separated line into a list of ints.
+        Parse a CSV or space-separated line into a list of floats.
         
         Args:
             line (str): Raw line from serial
             
         Returns:
-            list or None: List of parsed integers, or None on parse error
+            list or None: List of parsed floats, or None on parse error
         """
         line = line.strip()
         if not line or line == "<no-data>":
@@ -59,9 +59,9 @@ class DataLogger:
         # Allow commas and/or whitespace as separators
         parts = re.split(r'[,\s]+', line)
         try:
-            vals = list(map(int, parts))
+            vals = list(map(float, parts))
         except ValueError:
-            print(f"Warning: non-integer in line: {line}")
+            print(f"Warning: non-numeric in line: {line}")
             return None
             
         if len(vals) != self.num_channels:
@@ -213,6 +213,40 @@ class DataLogger:
             list: List of (x_data, y_data) tuples for each channel
         """
         return [self.get_channel_data(i, max_points) for i in range(self.num_channels)]
+    
+    def get_adc_data(self, max_points=None):
+        """
+        Get data from ADC channels (channels 0-7).
+        
+        Args:
+            max_points (int, optional): Maximum points per channel
+            
+        Returns:
+            list: List of (x_data, y_data) tuples for ADC channels
+        """
+        adc_channels = min(8, self.num_channels)  # Handle cases where we have fewer than 8 channels
+        return [self.get_channel_data(i, max_points) for i in range(adc_channels)]
+    
+    def get_imu_data(self, max_points=None):
+        """
+        Get data from IMU channels (channels 8-16: acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,mag_x,mag_y,mag_z).
+        
+        Args:
+            max_points (int, optional): Maximum points per channel
+            
+        Returns:
+            dict: Dictionary with 'accelerometer', 'gyroscope', 'magnetometer' keys,
+                  each containing list of (x_data, y_data) tuples for x,y,z axes
+        """
+        if self.num_channels < 17:
+            return {'accelerometer': [], 'gyroscope': [], 'magnetometer': []}
+        
+        imu_data = {
+            'accelerometer': [self.get_channel_data(8+i, max_points) for i in range(3)],   # channels 8,9,10
+            'gyroscope': [self.get_channel_data(11+i, max_points) for i in range(3)],      # channels 11,12,13
+            'magnetometer': [self.get_channel_data(14+i, max_points) for i in range(3)]    # channels 14,15,16
+        }
+        return imu_data
     
     def clear_buffers(self):
         """Clear all channel buffers."""
