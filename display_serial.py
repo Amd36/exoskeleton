@@ -3,10 +3,11 @@ import matplotlib.animation as animation
 from DataLogger import DataLogger
 
 # === CONFIGURATION ===
-# SERIAL_PORT = '/dev/ttyUSB0'  # ubuntu
-SERIAL_PORT = 'COM5'  # windows
+SERIAL_PORT = '/dev/ttyUSB0'  # ubuntu
+# SERIAL_PORT = 'COM5'  # windows
 BAUD_RATE = 115200
-NUM_CH = 8
+# NUM_CH = 9  # When receiving only IMU data: 3 acc + 3 gyro + 3 mag
+NUM_CH = 17  # When ESP32 sends 8 ADC + 9 IMU
 SAMPLES_PER_EVENT = 2  # ESP prints up to 2 rows per event
 BUFFER_LEN = 20000  # keep a large buffer to avoid data loss (20k samples)
 
@@ -20,9 +21,16 @@ data_logger = DataLogger(
 )
 
 def init():
-    for ln in lines:
+    # Initialize ADC lines
+    for ln in adc_lines:
         ln.set_data([], [])
-    return tuple(lines)
+    
+    # Initialize IMU lines
+    for sensor_lines in [acc_lines, gyro_lines, mag_lines]:
+        for ln in sensor_lines:
+            ln.set_data([], [])
+    
+    return tuple(adc_lines + acc_lines + gyro_lines + mag_lines)
 
 def update(frame):
     """Update function for matplotlib animation using DataLogger."""
@@ -31,45 +39,158 @@ def update(frame):
         drained = data_logger.update_buffers()
         
         if drained == 0:
-            if 'lines' in globals() and lines is not None:
-                return tuple(lines)
-            return ()
+            return tuple(adc_lines + acc_lines + gyro_lines + mag_lines)
 
-        # Get data for all channels with downsampling for performance
+                # Get data with downsampling for performance
         max_plot_points = 2000  # cap points shown for performance
-        channel_data = data_logger.get_all_channel_data(max_points=max_plot_points)
         
-        for c in range(NUM_CH):
-            if c < len(channel_data):
-                x, y = channel_data[c]
-                lines[c].set_data(x, y)
+        # Check if we have ADC data (channels 0-7) or only IMU data
+        if NUM_CH >= 17:
+            # Full system: 8 ADC + 9 IMU
+            # Update ADC plots (convert floats to integers if needed)
+            adc_data = data_logger.get_adc_data(max_points=max_plot_points)
+            for c in range(min(8, len(adc_data))):
+                x, y = adc_data[c]
+                # Ensure ADC values are displayed as integers (in case they come as floats)
+                y_int = [int(val) for val in y]
+                adc_lines[c].set_data(x, y_int)
+        
+        # Update IMU plots (works for both 9-channel and 17-channel modes)
+        imu_data = data_logger.get_imu_data(max_points=max_plot_points)
+        
+        # For 9-channel mode, map channels directly to IMU sensors
+        if NUM_CH == 9:
+            # Direct mapping: channels 0-2=acc, 3-5=gyro, 6-8=mag
+            all_data = data_logger.get_all_channel_data(max_points=max_plot_points)
+            if len(all_data) >= 9:
+                # Accelerometer (channels 0-2)
+                for i in range(3):
+                    if i < len(acc_lines):
+                        x, y = all_data[i]
+                        acc_lines[i].set_data(x, y)
+                
+                # Gyroscope (channels 3-5)
+                for i in range(3):
+                    if i < len(gyro_lines):
+                        x, y = all_data[3 + i]
+                        gyro_lines[i].set_data(x, y)
+                
+                # Magnetometer (channels 6-8)
+                for i in range(3):
+                    if i < len(mag_lines):
+                        x, y = all_data[6 + i]
+                        mag_lines[i].set_data(x, y)
+        else:
+            # 17-channel mode: use the dedicated IMU methods
+            # Update accelerometer
+            if 'accelerometer' in imu_data:
+                for i, (x, y) in enumerate(imu_data['accelerometer']):
+                    if i < len(acc_lines):
+                        # Data is already in real units (m/s²)
+                        acc_lines[i].set_data(x, y)
+            
+            # Update gyroscope
+            if 'gyroscope' in imu_data:
+                for i, (x, y) in enumerate(imu_data['gyroscope']):
+                    if i < len(gyro_lines):
+                        # Data is already in real units (rad/s)
+                        gyro_lines[i].set_data(x, y)
+            
+            # Update magnetometer
+            if 'magnetometer' in imu_data:
+                for i, (x, y) in enumerate(imu_data['magnetometer']):
+                    if i < len(mag_lines):
+                        # Data is already in real units (µT)
+                        mag_lines[i].set_data(x, y)
 
     except Exception as e:
         print("Error in update:", e)
     
-    if 'lines' in globals() and lines is not None:
-        return tuple(lines)
-    return ()
+    return tuple(adc_lines + acc_lines + gyro_lines + mag_lines)
 
 if __name__ == "__main__":
     # === SETUP PLOT ===
-    fig, ax = plt.subplots(figsize=(10, 6))
-    lines = []
-    for ch in range(NUM_CH):
-        ln, = ax.plot([], [], label=f'Channel {ch+1}')
-        lines.append(ln)
-    ax.set_xlim(0, BUFFER_LEN)
-    ax.set_ylim(0, 4095)
-    ax.set_title(f"ESP32 {NUM_CH}-Channel ADC Real-Time")
-    ax.set_xlabel("Sample")
-    ax.set_ylabel("ADC Value")
-    ax.legend(loc='upper right')
+    if NUM_CH >= 17:
+        # Full system with ADC + IMU: 2x2 layout
+        fig = plt.figure(figsize=(15, 10))
+        ax_adc = plt.subplot(2, 2, 1)
+        ax_acc = plt.subplot(2, 2, 2)
+        ax_gyro = plt.subplot(2, 2, 3)
+        ax_mag = plt.subplot(2, 2, 4)
+        
+        # Setup ADC plot (channels 0-7)
+        adc_lines = []
+        for ch in range(8):
+            ln, = ax_adc.plot([], [], label=f'ADC{ch+1}')
+            adc_lines.append(ln)
+        ax_adc.set_xlim(0, BUFFER_LEN)
+        ax_adc.set_ylim(0, 4095)
+        ax_adc.set_title("ADC Channels (0-4095)")
+        ax_adc.set_xlabel("Sample")
+        ax_adc.set_ylabel("ADC Value")
+        ax_adc.legend(loc='upper right')
+        ax_adc.grid(True, alpha=0.3)
+    else:
+        # IMU only: 1x3 layout
+        fig = plt.figure(figsize=(15, 5))
+        ax_acc = plt.subplot(1, 3, 1)
+        ax_gyro = plt.subplot(1, 3, 2)
+        ax_mag = plt.subplot(1, 3, 3)
+        adc_lines = []  # Empty list for compatibility
+    
+    # Setup Accelerometer plot (m/s²)
+    acc_lines = []
+    acc_labels = ['Acc X', 'Acc Y', 'Acc Z']
+    acc_colors = ['red', 'green', 'blue']
+    for i, (label, color) in enumerate(zip(acc_labels, acc_colors)):
+        ln, = ax_acc.plot([], [], label=label, color=color)
+        acc_lines.append(ln)
+    ax_acc.set_xlim(0, BUFFER_LEN)
+    ax_acc.set_ylim(-2000, 2000)  # Typical accelerometer range
+    ax_acc.set_title("Accelerometer (m/s²)")
+    ax_acc.set_xlabel("Sample")
+    ax_acc.set_ylabel("Acceleration (m/s²)")
+    ax_acc.legend()
+    ax_acc.grid(True, alpha=0.3)
+    
+    # Setup Gyroscope plot (rad/s)
+    gyro_lines = []
+    gyro_labels = ['Gyro X', 'Gyro Y', 'Gyro Z']
+    gyro_colors = ['red', 'green', 'blue']
+    for i, (label, color) in enumerate(zip(gyro_labels, gyro_colors)):
+        ln, = ax_gyro.plot([], [], label=label, color=color)
+        gyro_lines.append(ln)
+    ax_gyro.set_xlim(0, BUFFER_LEN)
+    ax_gyro.set_ylim(-1000, 1000)  # Typical gyroscope range
+    ax_gyro.set_title("Gyroscope (rad/s)")
+    ax_gyro.set_xlabel("Sample")
+    ax_gyro.set_ylabel("Angular Velocity (rad/s)")
+    ax_gyro.legend()
+    ax_gyro.grid(True, alpha=0.3)
+    
+    # Setup Magnetometer plot (µT)
+    mag_lines = []
+    mag_labels = ['Mag X', 'Mag Y', 'Mag Z']
+    mag_colors = ['red', 'green', 'blue']
+    for i, (label, color) in enumerate(zip(mag_labels, mag_colors)):
+        ln, = ax_mag.plot([], [], label=label, color=color)
+        mag_lines.append(ln)
+    ax_mag.set_xlim(0, BUFFER_LEN)
+    ax_mag.set_ylim(-10000, 10000)  # Typical magnetometer range
+    ax_mag.set_title("Magnetometer (µT)")
+    ax_mag.set_xlabel("Sample")
+    ax_mag.set_ylabel("Magnetic Field (µT)")
+    ax_mag.legend()
+    ax_mag.grid(True, alpha=0.3)
+    
+    # Adjust layout to prevent overlap
+    plt.tight_layout()
 
     # Start data logging
     data_logger.start_logging()
 
-    # Animation interval controls UI refresh; keep it modest (e.g., 50 ms) while the reader handles high-rate IO.
-    ani = animation.FuncAnimation(fig, update, init_func=init, blit=False, interval=50)
+    # Animation interval controls UI refresh; keep it modest (e.g., 100 ms) for multiple subplots
+    ani = animation.FuncAnimation(fig, update, init_func=init, blit=False, interval=100)
 
     try:
         plt.show()
