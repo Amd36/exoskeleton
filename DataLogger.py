@@ -10,6 +10,8 @@ import re
 import threading
 import queue
 from collections import deque
+import os
+import numpy as np
 
 
 class DataLogger:
@@ -278,8 +280,8 @@ class DataLogger:
         Returns:
             list: List of filenames that were created
         """
-        import os
-        import numpy as np
+        # import os
+        # import numpy as np
         
         created_files = []
         
