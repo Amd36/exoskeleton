@@ -20,7 +20,7 @@ class DataLogger:
         Initialize the DataLogger.
         
         Args:
-            port (str): Serial port path (e.g., '/dev/ttyUSB0' or 'COM3')
+            port (str): Serial port path (e.g., '/dev/ttyUSB0' or 'COM8')
             baud_rate (int): Serial communication baud rate
             num_channels (int): Number of data channels expected
             buffer_length (int): Maximum number of samples to keep in buffer
@@ -268,54 +268,114 @@ class DataLogger:
                 self.reader_thread.is_alive() and 
                 not self.reader_stop.is_set())
     
-    def save_data(self, filename_prefix="channel", file_extension=".dat", save_directory="."):
+    def save_data(self, filename_prefix="channel", file_extension=".csv", save_directory=".saved_data", skip_initial_zeros=True, sample_rate=1000.0, timestamp_start=0.0, combined=False):
         """
-        Save data from each channel to separate files.
-        
+        Save data from channels to CSV files with timestamps.
+1
+        By default this writes one CSV per channel containing two columns: timestamp, value.
+        Optionally a single combined CSV with columns `timestamp,ch1,ch2,...` can be created via
+        `combined=True`.
+
         Args:
             filename_prefix (str): Prefix for the output files (default: "channel")
-            file_extension (str): File extension (default: ".dat")
-            save_directory (str): Directory to save files (default: current directory)
-        
+            file_extension (str): File extension (default: ".csv")
+            save_directory (str): Directory to save files (default: ".saved_data")
+            skip_initial_zeros (bool): Skip leading zeros from buffer initialization (default: True)
+            sample_rate (float): Sampling rate in Hz used to generate timestamps (default: 1000.0)
+            timestamp_start (float): Starting timestamp in seconds for the first sample (default: 0.0)
+            combined (bool): If True, produce a single combined CSV with all channels (default: False)
+
         Returns:
             list: List of filenames that were created
         """
-        # import os
-        # import numpy as np
-        
+
         created_files = []
-        
+
         # Ensure save directory exists
         if not os.path.exists(save_directory):
             os.makedirs(save_directory)
-        
+
+        # Helper to trim initial zeros (preserve if all zeros)
+        def _trim_initial_zeros(arr):
+            if not skip_initial_zeros or len(arr) == 0:
+                return arr
+            non_zero_indices = np.nonzero(arr)[0]
+            if len(non_zero_indices) > 0:
+                return arr[non_zero_indices[0]:]
+            return arr
+
+        # Gather trimmed channel arrays
+        channel_arrays = []
         for channel_idx in range(self.num_channels):
-            # Create filename
+            channel_data = np.array(list(self.channels[channel_idx]))
+            channel_data = _trim_initial_zeros(channel_data)
+            channel_arrays.append(channel_data)
+
+        # If combined output requested, align lengths (use shortest channel length)
+        if combined:
+            if len(channel_arrays) == 0:
+                return created_files
+
+            lengths = [len(a) for a in channel_arrays]
+            min_len = min(lengths)
+            if min_len == 0:
+                print("Warning: one or more channels have no data for combined output")
+            # Trim all arrays to min_len (take the last min_len samples to keep most recent data)
+            aligned = [a[-min_len:] if len(a) >= min_len else np.pad(a, (min_len - len(a), 0), 'constant') for a in channel_arrays]
+            if sample_rate is None or sample_rate <= 0:
+                timestamps = np.arange(min_len) + timestamp_start
+            else:
+                timestamps = (np.arange(min_len) / float(sample_rate)) + float(timestamp_start)
+
+            # Stack timestamps + channels
+            try:
+                data_matrix = np.column_stack([timestamps] + aligned)
+                filename = f"{filename_prefix}_all{file_extension}"
+                filepath = os.path.join(save_directory, filename)
+                header = 'timestamp,' + ','.join([f'ch{idx+1}' for idx in range(self.num_channels)])
+                np.savetxt(filepath, data_matrix, delimiter=',', header=header, comments='', fmt='%.6f')
+                created_files.append(filepath)
+                print(f"Saved combined data to {filepath} (text CSV, {min_len} samples)")
+            except Exception as e:
+                print(f"Error saving combined CSV: {e}")
+
+            return created_files
+
+        # Per-channel CSVs
+        for channel_idx, channel_data in enumerate(channel_arrays):
+            if channel_data is None or len(channel_data) == 0:
+                print(f"Skipping channel {channel_idx + 1}: no data to save")
+                continue
+
+            # timestamps for this channel (oldest -> newest)
+            n = len(channel_data)
+            if sample_rate is None or sample_rate <= 0:
+                timestamps = np.arange(n) + timestamp_start
+            else:
+                timestamps = (np.arange(n) / float(sample_rate)) + float(timestamp_start)
+
             filename = f"{filename_prefix}{channel_idx + 1}{file_extension}"
             filepath = os.path.join(save_directory, filename)
-            
+
             try:
-                # Convert deque to numpy array for saving
-                channel_data = np.array(list(self.channels[channel_idx]))
-                
-                # Save as binary file (faster) or text file based on extension
                 if file_extension.lower() in ['.dat', '.bin']:
-                    # Save as binary file (more efficient for large datasets)
+                    # Binary format: only save raw values (timestamps not saved for binary mode)
                     channel_data.astype(np.float64).tofile(filepath)
-                    print(f"Saved channel {channel_idx + 1} data to {filepath} (binary format)")
+                    print(f"Saved channel {channel_idx + 1} data to {filepath} (binary format, {n} samples). Timestamps not included for binary files.")
                 else:
-                    # Save as text file (human readable)
-                    np.savetxt(filepath, channel_data, fmt='%.6f')
-                    print(f"Saved channel {channel_idx + 1} data to {filepath} (text format)")
-                
+                    # CSV: two columns timestamp,value
+                    out_mat = np.column_stack((timestamps, channel_data))
+                    np.savetxt(filepath, out_mat, delimiter=',', header='timestamp,value', comments='', fmt='%.6f')
+                    print(f"Saved channel {channel_idx + 1} data to {filepath} (CSV, {n} samples)")
+
                 created_files.append(filepath)
-                
+
             except Exception as e:
                 print(f"Error saving channel {channel_idx + 1} data: {e}")
-        
+
         if created_files:
-            print(f"Successfully saved {len(created_files)} channel files")
-        
+            print(f"Successfully saved {len(created_files)} file(s)")
+
         return created_files
 
 
