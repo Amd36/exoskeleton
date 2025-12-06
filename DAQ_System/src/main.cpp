@@ -50,7 +50,7 @@ void samplingTask(void* pvParameters) {
     sample_t row[NUM_CH];
     
     // Read ADC channels first (channels 0-7)
-    const int chPins[NUM_ADC_CH] = {34, 35, 36, 39, 32, 33, 25, 26};
+    const int chPins[NUM_ADC_CH] = {36, 39, 34, 35, 32, 33, 25, 26};
     for (size_t i = 0; i < NUM_ADC_CH; ++i) {
       row[i] = static_cast<sample_t>(analogRead(chPins[i]));
     }

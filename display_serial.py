@@ -3,11 +3,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from DataLogger import DataLogger
-import threading
-import time
-from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import urllib.parse as urlparse
 
 # === CONFIGURATION ===
 SERIAL_PORT = '/dev/ttyUSB0'  # ubuntu
@@ -16,7 +11,7 @@ BAUD_RATE = 115200
 # NUM_CH = 9  # When receiving only IMU data: 3 acc + 3 gyro + 3 mag
 NUM_CH = 17  # When ESP32 sends 8 ADC + 9 IMU
 SAMPLES_PER_EVENT = 2  # ESP prints up to 2 rows per event
-BUFFER_LEN = 20000  # keep a large buffer to avoid data loss (20k samples)
+BUFFER_LEN = 5000  # keep a large buffer to avoid data loss (20k samples)
 
 # Initialize DataLogger
 data_logger = DataLogger(
@@ -26,148 +21,6 @@ data_logger = DataLogger(
     buffer_length=BUFFER_LEN,
     samples_per_event=SAMPLES_PER_EVENT
 )
-
-# Saving control
-_save_held = False
-_save_thread = None
-_save_interval = 1.0 / 250.0  # seconds between save attempts while key held (250 Hz)
-_save_dir_prefix = "saved_data"
-
-def _ensure_dir(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
-
-def _saver_loop():
-    """Background loop that saves data while _save_held is True."""
-    global _save_held
-    # Make a session directory once per hold so we append to the same files
-    session_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    session_dir = os.path.join(_save_dir_prefix, session_ts)
-    _ensure_dir(session_dir)
-
-    # Prepare per-channel file handles opened in append-binary mode
-    file_handles = []
-    try:
-        for ch_idx in range(data_logger.num_channels):
-            fname = os.path.join(session_dir, f"channel_{ch_idx+1}.dat")
-            # Ensure file exists
-            fh = open(fname, 'ab')
-            file_handles.append(fh)
-
-        # Track last written lengths per channel to only append new samples
-        last_lens = [len(ch) for ch in data_logger.channels]
-
-        while _save_held:
-            try:
-                for ch_idx, ch in enumerate(data_logger.channels):
-                    cur_len = len(ch)
-                    last_len = last_lens[ch_idx]
-                    if cur_len == last_len:
-                        continue
-
-                    # If buffer grew normally, write the new slice
-                    if cur_len > last_len:
-                        new_vals = list(ch)[last_len:cur_len]
-                    else:
-                        # Buffer wrapped or was cleared; write the entire buffer
-                        new_vals = list(ch)
-
-                    if new_vals:
-                        arr = np.array(new_vals, dtype=np.float64)
-                        try:
-                            arr.tofile(file_handles[ch_idx])
-                        except Exception as e:
-                            print(f"Error appending to channel {ch_idx+1}:", e)
-
-                    last_lens[ch_idx] = cur_len
-
-                time.sleep(_save_interval)
-            except Exception as e:
-                print("Error in saver loop iteration:", e)
-                time.sleep(_save_interval)
-    finally:
-        # Close all file handles
-        for fh in file_handles:
-            try:
-                fh.close()
-            except Exception:
-                pass
-
-
-# Control helpers for starting/stopping the saver from outside (HTTP/FIFO/etc)
-def start_saving():
-    global _save_held, _save_thread
-    if _save_held:
-        return False
-    _save_held = True
-    _save_thread = threading.Thread(target=_saver_loop, daemon=True)
-    _save_thread.start()
-    print("Saver started via control")
-    return True
-
-def stop_saving():
-    global _save_held
-    if not _save_held:
-        return False
-    _save_held = False
-    print("Saver stop requested via control")
-    return True
-
-def save_once():
-    # One-shot save using DataLogger.save_data into a timestamped directory
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    session_dir = os.path.join(_save_dir_prefix, ts)
-    _ensure_dir(session_dir)
-    try:
-        data_logger.save_data(filename_prefix="channel_", file_extension=".dat", save_directory=session_dir)
-        return True
-    except Exception as e:
-        print("Error in save_once:", e)
-        return False
-
-
-class SimpleCtrlHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        parsed = urlparse.urlparse(self.path)
-        path = parsed.path
-        response = b""
-        code = 200
-        if path == "/save/start":
-            ok = start_saving()
-            response = b"started" if ok else b"already"
-        elif path == "/save/stop":
-            ok = stop_saving()
-            response = b"stopped" if ok else b"not-running"
-        elif path == "/save/once":
-            ok = save_once()
-            response = b"saved" if ok else b"error"
-        else:
-            code = 404
-            response = b"not-found"
-
-        self.send_response(code)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(response)))
-        self.end_headers()
-        self.wfile.write(response)
-
-
-def run_control_http_server(host='127.0.0.1', port=8000):
-    try:
-        server = HTTPServer((host, port), SimpleCtrlHandler)
-        t = threading.Thread(target=server.serve_forever, daemon=True)
-        t.start()
-        print(f"Control HTTP server running on http://{host}:{port}")
-        return server
-    except Exception as e:
-        print("Failed to start control HTTP server:", e)
-        return None
-
-def on_key_press(event):
-    pass
-
-def on_key_release(event):
-    pass
 
 def init():
     # Initialize ADC lines
@@ -190,7 +43,7 @@ def update(frame):
         if drained == 0:
             return tuple(adc_lines + acc_lines + gyro_lines + mag_lines)
 
-                # Get data with downsampling for performance
+        # Get data with downsampling for performance
         max_plot_points = 2000  # cap points shown for performance
         
         # Check if we have ADC data (channels 0-7) or only IMU data
@@ -340,9 +193,6 @@ if __name__ == "__main__":
 
     # Start data logging
     data_logger.start_logging()
-
-    # Start local control HTTP server (127.0.0.1:8000)
-    control_server = run_control_http_server(host='127.0.0.1', port=8000)
 
     # Animation interval controls UI refresh; keep it modest (e.g., 100 ms) for multiple subplots
     ani = animation.FuncAnimation(fig, update, init_func=init, blit=False, interval=100)
