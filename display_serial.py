@@ -5,9 +5,9 @@ import matplotlib.animation as animation
 from DataLogger import DataLogger
 
 # === CONFIGURATION ===
-# SERIAL_PORT = '/dev/ttyUSB0'  # ubuntu
-SERIAL_PORT = 'COM8'  # windows
-BAUD_RATE = 115200
+SERIAL_PORT = '/dev/ttyUSB0'  # ubuntu
+# SERIAL_PORT = 'COM8'  # windows
+BAUD_RATE = 1500000
 # NUM_CH = 9  # When receiving only IMU data: 3 acc + 3 gyro + 3 mag
 NUM_CH = 17  # When ESP32 sends 8 ADC + 9 IMU
 SAMPLES_PER_EVENT = 2  # ESP prints up to 2 rows per event

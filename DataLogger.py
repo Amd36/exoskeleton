@@ -311,6 +311,12 @@ class DataLogger:
             channel_data = _trim_initial_zeros(channel_data)
             channel_arrays.append(channel_data)
 
+        channel_map = {1: 'piezo1', 2: 'piezo2', 3: 'piezo3', 4: 'piezo4',
+                       5: 'piezo5', 6: 'piezo6', 7: 'fsr1', 8: 'fsr2',
+                       9: 'acc_x', 10: 'acc_y', 11: 'acc_z',
+                       12: 'gyro_x', 13: 'gyro_y', 14: 'gyro_z',
+                       15: 'mag_x', 16: 'mag_y', 17: 'mag_z'}
+
         # If combined output requested, align lengths (use shortest channel length)
         if combined:
             if len(channel_arrays) == 0:
@@ -332,7 +338,7 @@ class DataLogger:
                 data_matrix = np.column_stack([timestamps] + aligned)
                 filename = f"{filename_prefix}_all{file_extension}"
                 filepath = os.path.join(save_directory, filename)
-                header = 'timestamp,' + ','.join([f'ch{idx+1}' for idx in range(self.num_channels)])
+                header = 'timestamp,' + ','.join([channel_map[idx+1] for idx in range(self.num_channels)])
                 np.savetxt(filepath, data_matrix, delimiter=',', header=header, comments='', fmt='%.6f')
                 created_files.append(filepath)
                 print(f"Saved combined data to {filepath} (text CSV, {min_len} samples)")
@@ -354,7 +360,7 @@ class DataLogger:
             else:
                 timestamps = (np.arange(n) / float(sample_rate)) + float(timestamp_start)
 
-            filename = f"{filename_prefix}{channel_idx + 1}{file_extension}"
+            filename = f"{filename_prefix}{channel_map[channel_idx + 1]}{file_extension}"
             filepath = os.path.join(save_directory, filename)
 
             try:

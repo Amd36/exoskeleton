@@ -23,14 +23,15 @@ import numpy as np
 
 def main():
     parser = argparse.ArgumentParser(description='Record 5 seconds from DataLogger and save CSVs')
-    parser.add_argument('--port', default='COM8', help='Serial port (e.g. COM8)')
-    parser.add_argument('--baud', type=int, default=115200, help='Baud rate')
+    parser.add_argument('--port', default='/dev/ttyUSB0', help='Serial port (e.g. COM8)')
+    parser.add_argument('--baud', type=int, default=1200000, help='Baud rate')
     parser.add_argument('--num-ch', type=int, default=17, help='Number of channels expected')
     parser.add_argument('--duration', type=float, default=5.0, help='Duration to record (seconds)')
     parser.add_argument('--sample-rate', type=float, default=1000.0, help='Sampling rate in Hz for timestamps')
     parser.add_argument('--save-dir', default='saved_data', help='Directory to save CSVs')
     parser.add_argument('--simulate', action='store_true', help='Simulate data rather than open serial')
     parser.add_argument('--combined', action='store_true', help='Save single combined CSV instead of per-channel files')
+    parser.add_argument('--filename', default='', help='Filename prefix for the saved data')
     args = parser.parse_args()
 
     # Import DataLogger after parsing so a user can edit the module then re-run the script.
@@ -68,7 +69,7 @@ def main():
             dq = logger.channels[ch]
             dq.clear()
             for v in sig:
-                dq.append(float(v))
+                dq.append(int(float(v)))
 
         print(f'Simulated {needed_samples} samples per channel')
 
@@ -78,6 +79,11 @@ def main():
         logger.start_logging()
         # wait a little for thread to open serial
         time.sleep(2.0)
+
+        print("Data collection starting in:")
+        for count in range(5, -1, -1):
+            time.sleep(1.0)
+            print(f'...{count}')
 
         print(f'Collecting data for {args.duration:.1f} seconds...')
         start_t = time.time()
@@ -100,7 +106,7 @@ def main():
 
     print('\nSaving data to files...')
     try:
-        saved = logger.save_data(filename_prefix='test_',
+        saved = logger.save_data(filename_prefix=args.filename,
                                  file_extension='.csv',
                                  save_directory=args.save_dir,
                                  skip_initial_zeros=True,
