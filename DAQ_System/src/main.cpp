@@ -9,8 +9,8 @@ hw_timer_t* timer1 = nullptr;
 hw_timer_t* timer2 = nullptr;
 
 constexpr uint32_t TIMER_PRESCALER = 80; // 1 µs tick
-constexpr uint64_t T1_PERIOD_US = 1000; // 1000 Hz
-constexpr uint64_t T2_PERIOD_US = 2000; // 500 Hz
+constexpr uint64_t T1_PERIOD_US = 1000;  // 1000 Hz
+constexpr uint64_t T2_PERIOD_US = 2000;  // 500 Hz
 
 // FreeRTOS queue used to send simple event IDs from ISRs to a printing task.
 QueueHandle_t printQueue = NULL;
@@ -24,13 +24,13 @@ TaskHandle_t samplingTaskHandle = NULL;
 
 // Circular FIFO buffer: 50 rows x 17 channels (8 ADC + 9 BNO055)
 constexpr size_t NUM_ROWS = 50;
-constexpr size_t NUM_ADC_CH = 8; // Original ADC channels
-constexpr size_t NUM_BNO055_CH = 9; // 3 acc + 3 gyro + 3 mag
+constexpr size_t NUM_ADC_CH = 8;       // Original ADC channels
+constexpr size_t NUM_BNO055_CH = 9;    // 3 acc + 3 gyro + 3 mag
 constexpr size_t NUM_CH = NUM_ADC_CH + NUM_BNO055_CH; // Total: 17 channels
 using sample_t = int16_t; // Use signed for compatibility with BNO055 data
 static sample_t buffer[NUM_ROWS][NUM_CH];
-static size_t buf_head = 0; // next write index
-static size_t buf_tail = 0; // next read index
+static size_t buf_head = 0;  // next write index
+static size_t buf_tail = 0;  // next read index
 static size_t buf_count = 0; // number of rows stored
 
 // Mutex to protect buffer access
@@ -38,6 +38,34 @@ SemaphoreHandle_t bufMutex = NULL;
 
 // BNO055 sensor object using I2C with custom pins
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x29, &Wire);
+
+// ---------- Binary packet definition ----------
+// Packet format (little-endian, 40 bytes total):
+// uint16_t sync   = 0xA55A
+// uint16_t index  = running packet counter
+// uint16_t adc[8] = 8 ADC channels (0..4095)
+// int16_t  imu[9] = 9 IMU channels
+// uint16_t checksum = 16-bit sum of all bytes except checksum
+#pragma pack(push, 1)
+struct SamplePacket {
+  uint16_t sync;
+  uint16_t index;
+  uint16_t adc[NUM_ADC_CH];
+  int16_t  imu[NUM_BNO055_CH];
+  uint16_t checksum;
+};
+#pragma pack(pop)
+
+static SamplePacket pkt;
+static uint16_t packetIndex = 0;
+
+uint16_t computeChecksum(const uint8_t* data, size_t len) {
+  uint32_t sum = 0;
+  for (size_t i = 0; i < len; i++) {
+    sum += data[i];
+  }
+  return static_cast<uint16_t>(sum & 0xFFFF);
+}
 
 // Sampling task: waits for notification from T1 ISR, reads ADC channels and BNO055 sensor data,
 // and pushes the row into the circular FIFO.
@@ -48,29 +76,29 @@ void samplingTask(void* pvParameters) {
 
     // Read data from both ADC channels and BNO055 sensor
     sample_t row[NUM_CH];
-    
+
     // Read ADC channels first (channels 0-7)
     const int chPins[NUM_ADC_CH] = {36, 39, 34, 35, 32, 33, 25, 26};
     for (size_t i = 0; i < NUM_ADC_CH; ++i) {
       row[i] = static_cast<sample_t>(analogRead(chPins[i]));
     }
-    
+
     // Read BNO055 sensor data (channels 8-16)
     sensors_event_t accelData, gyroData, magData;
     bno.getEvent(&accelData, Adafruit_BNO055::VECTOR_ACCELEROMETER);
     bno.getEvent(&gyroData, Adafruit_BNO055::VECTOR_GYROSCOPE);
     bno.getEvent(&magData, Adafruit_BNO055::VECTOR_MAGNETOMETER);
-    
+
     // Convert to int16_t and store in buffer (multiply by 100 to preserve 2 decimal places)
-    row[8] = static_cast<sample_t>(accelData.acceleration.x * 100);  // acc_x
-    row[9] = static_cast<sample_t>(accelData.acceleration.y * 100);  // acc_y
-    row[10] = static_cast<sample_t>(accelData.acceleration.z * 100); // acc_z
-    row[11] = static_cast<sample_t>(gyroData.gyro.x * 100);          // gyro_x
-    row[12] = static_cast<sample_t>(gyroData.gyro.y * 100);          // gyro_y
-    row[13] = static_cast<sample_t>(gyroData.gyro.z * 100);          // gyro_z
-    row[14] = static_cast<sample_t>(magData.magnetic.x * 100);       // mag_x
-    row[15] = static_cast<sample_t>(magData.magnetic.y * 100);       // mag_y
-    row[16] = static_cast<sample_t>(magData.magnetic.z * 100);       // mag_z
+    row[8]  = static_cast<sample_t>(accelData.acceleration.x * 100);  // acc_x
+    row[9]  = static_cast<sample_t>(accelData.acceleration.y * 100);  // acc_y
+    row[10] = static_cast<sample_t>(accelData.acceleration.z * 100);  // acc_z
+    row[11] = static_cast<sample_t>(gyroData.gyro.x * 100);           // gyro_x
+    row[12] = static_cast<sample_t>(gyroData.gyro.y * 100);           // gyro_y
+    row[13] = static_cast<sample_t>(gyroData.gyro.z * 100);           // gyro_z
+    row[14] = static_cast<sample_t>(magData.magnetic.x * 100);        // mag_x
+    row[15] = static_cast<sample_t>(magData.magnetic.y * 100);        // mag_y
+    row[16] = static_cast<sample_t>(magData.magnetic.z * 100);        // mag_z
 
     // Push into circular buffer
     if (xSemaphoreTake(bufMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -92,8 +120,8 @@ void samplingTask(void* pvParameters) {
   }
 }
 
-// Task: wait for print events and print from task context (safe for Serial). When EVT_T2 is received,
-// dequeue up to 2 rows and print them as CSV: adc0,adc1,...,adc7,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,mag_x,mag_y,mag_z
+// Task: wait for print events and send binary packets from task context (safe for Serial).
+// When EVT_T2 is received, dequeue up to 2 rows and send them as binary packets.
 void printTask(void* pvParameters) {
   uint8_t evt;
   for (;;) {
@@ -105,7 +133,9 @@ void printTask(void* pvParameters) {
           sample_t row[NUM_CH];
           if (xSemaphoreTake(bufMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             if (buf_count > 0) {
-              for (size_t c = 0; c < NUM_CH; ++c) row[c] = buffer[buf_tail][c];
+              for (size_t c = 0; c < NUM_CH; ++c) {
+                row[c] = buffer[buf_tail][c];
+              }
               buf_tail = (buf_tail + 1) % NUM_ROWS;
               buf_count--;
               haveRow = true;
@@ -114,15 +144,30 @@ void printTask(void* pvParameters) {
           }
 
           if (haveRow) {
-            // Print the row as CSV: adc0,adc1,...,adc7,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,mag_x,mag_y,mag_z
-            for (size_t c = 0; c < NUM_CH; ++c) {
-              Serial.print(row[c]);
-              if (c + 1 < NUM_CH) Serial.print(',');
+            // Fill binary packet from row
+            pkt.sync  = 0xA55A;
+            pkt.index = packetIndex++;
+
+            // ADC channels 0..7 → uint16_t
+            for (size_t i = 0; i < NUM_ADC_CH; ++i) {
+              pkt.adc[i] = static_cast<uint16_t>(row[i]);
             }
-            Serial.println();
+            // IMU channels 8..16 → int16_t
+            for (size_t i = 0; i < NUM_BNO055_CH; ++i) {
+              pkt.imu[i] = static_cast<int16_t>(row[NUM_ADC_CH + i]);
+            }
+
+            // Compute checksum over all bytes except checksum field itself
+            pkt.checksum = computeChecksum(
+              reinterpret_cast<const uint8_t*>(&pkt),
+              sizeof(SamplePacket) - sizeof(pkt.checksum)
+            );
+
+            // Send raw binary packet
+            Serial.write(reinterpret_cast<const uint8_t*>(&pkt), sizeof(SamplePacket));
           } else {
-            // No data available
-            Serial.println("<no-data>");
+            // No data available: do NOT send "<no-data>" for binary stream
+            // Just skip this send opportunity.
           }
         }
       }
@@ -131,14 +176,15 @@ void printTask(void* pvParameters) {
 }
 
 void setup() {
-  Serial.begin(115200);
+  // Use 900,000 baud so we can sustain 1 kHz × 40 bytes = 40 kB/s
+  Serial.begin(900000);
   delay(500);
 
   // Initialize I2C for BNO055 on pins 21 (SDA) and 22 (SCL)
   Wire.begin(21, 22);
   Wire.setClock(400000); // Set I2C frequency to 400kHz
   delay(100);
-  
+
   // Initialize BNO055 sensor using Adafruit library
   if (!bno.begin()) {
     Serial.println("Failed to initialize BNO055 sensor");
@@ -153,11 +199,8 @@ void setup() {
   // Create a queue that can hold up to 16 uint8_t event IDs
   printQueue = xQueueCreate(16, sizeof(uint8_t));
   if (printQueue == NULL) {
-    // Failed to create queue; indicate error via Serial once and return.
     Serial.println("Failed to create printQueue");
-    // We continue without queue but ISRs will check for NULL and skip.
   } else {
-    // Create the print task with a small stack. Priority 1 is fine here.
     xTaskCreate(printTask, "printTask", 2048, NULL, 1, NULL);
   }
 
@@ -186,6 +229,6 @@ void setup() {
 }
 
 void loop() {
-  // Nothing to do in loop; printing is handled by the FreeRTOS task.
-  delay(1000);
+  // Nothing to do in loop; sampling + sending handled by FreeRTOS tasks.
+  // delay(1000);
 }

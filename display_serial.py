@@ -2,16 +2,16 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from DataLogger import DataLogger
+from new_data_logger import DataLogger
 
 # === CONFIGURATION ===
 SERIAL_PORT = '/dev/ttyUSB0'  # ubuntu
 # SERIAL_PORT = 'COM8'  # windows
-BAUD_RATE = 1500000
+BAUD_RATE = 900000
 # NUM_CH = 9  # When receiving only IMU data: 3 acc + 3 gyro + 3 mag
 NUM_CH = 17  # When ESP32 sends 8 ADC + 9 IMU
 SAMPLES_PER_EVENT = 2  # ESP prints up to 2 rows per event
-BUFFER_LEN = 5000  # keep a large buffer to avoid data loss (e.g 20k samples)
+BUFFER_LEN = 20000  # keep a large buffer to avoid data loss (e.g 20k samples)
 
 # Initialize DataLogger
 data_logger = DataLogger(

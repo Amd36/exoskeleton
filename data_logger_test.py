@@ -24,7 +24,7 @@ import numpy as np
 def main():
     parser = argparse.ArgumentParser(description='Record 5 seconds from DataLogger and save CSVs')
     parser.add_argument('--port', default='/dev/ttyUSB0', help='Serial port (e.g. COM8)')
-    parser.add_argument('--baud', type=int, default=1200000, help='Baud rate')
+    parser.add_argument('--baud', type=int, default=900000, help='Baud rate')
     parser.add_argument('--num-ch', type=int, default=17, help='Number of channels expected')
     parser.add_argument('--duration', type=float, default=5.0, help='Duration to record (seconds)')
     parser.add_argument('--sample-rate', type=float, default=1000.0, help='Sampling rate in Hz for timestamps')
@@ -36,7 +36,7 @@ def main():
 
     # Import DataLogger after parsing so a user can edit the module then re-run the script.
     try:
-        import DataLogger as _DL
+        import new_data_logger as _DL
         importlib.reload(_DL)
         DataLogger = _DL.DataLogger
     except Exception as e:
