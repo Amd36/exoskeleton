@@ -2,233 +2,227 @@
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
-#include <utility/imumaths.h>
-#include <callbacks.h>
+#include <math.h>
 
-hw_timer_t* timer1 = nullptr;
-hw_timer_t* timer2 = nullptr;
+// ===================== Config =====================
+constexpr uint32_t SERIAL_BAUD = 921600;
+constexpr uint32_t I2C_HZ      = 400000;
 
-constexpr uint32_t TIMER_PRESCALER = 80; // 1 µs tick
-constexpr uint64_t T1_PERIOD_US = 1000;  // 1000 Hz
-constexpr uint64_t T2_PERIOD_US = 2000;  // 500 Hz
+constexpr uint32_t ADC_HZ      = 1000;   // ADC sampling rate (piezo)
+constexpr uint32_t IMU_HZ      = 100;    // accel+gyro sampling rate
+constexpr uint32_t MAG_HZ      = 20;     // magnetometer update rate (cached)
 
-// FreeRTOS queue used to send simple event IDs from ISRs to a printing task.
-QueueHandle_t printQueue = NULL;
+static_assert((IMU_HZ % MAG_HZ) == 0, "IMU_HZ must be divisible by MAG_HZ");
 
-// Event IDs (match callbacks.cpp)
-static const uint8_t EVT_T1 = 1;
-static const uint8_t EVT_T2 = 2;
+constexpr uint8_t  ADC_BLOCK   = 10;     // 10 ADC samples per frame (10ms)
+constexpr size_t   ADC_CH      = 8;
+constexpr size_t   IMU_CH      = 9;      // acc(3), gyro(3), mag(3)
 
-// Forward declare sampling task handle so ISR can notify it (defined below)
-TaskHandle_t samplingTaskHandle = NULL;
+constexpr uint16_t SYNC_WORD   = 0xA55A;
+constexpr uint8_t  PKT_VER     = 1;
+constexpr uint8_t  PKT_TYPE_FRAME = 1;
 
-// Circular FIFO buffer: 50 rows x 17 channels (8 ADC + 9 BNO055)
-constexpr size_t NUM_ROWS = 50;
-constexpr size_t NUM_ADC_CH = 8;       // Original ADC channels
-constexpr size_t NUM_BNO055_CH = 9;    // 3 acc + 3 gyro + 3 mag
-constexpr size_t NUM_CH = NUM_ADC_CH + NUM_BNO055_CH; // Total: 17 channels
-using sample_t = int16_t; // Use signed for compatibility with BNO055 data
-static sample_t buffer[NUM_ROWS][NUM_CH];
-static size_t buf_head = 0;  // next write index
-static size_t buf_tail = 0;  // next read index
-static size_t buf_count = 0; // number of rows stored
+// ADC pins (ESP32)
+static const int ADC_PINS[ADC_CH] = {36, 39, 34, 35, 32, 33, 25, 26};
 
-// Mutex to protect buffer access
-SemaphoreHandle_t bufMutex = NULL;
+// Queue depth: 256 frames = 2.56s cushion at 100Hz
+constexpr size_t TX_QUEUE_LEN = 256;
 
-// BNO055 sensor object using I2C with custom pins
-Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x29, &Wire);
+using sample_t = int16_t;
 
-// ---------- Binary packet definition ----------
-// Packet format (little-endian, 40 bytes total):
-// uint16_t sync   = 0xA55A
-// uint16_t index  = running packet counter
-// uint16_t adc[8] = 8 ADC channels (0..4095)
-// int16_t  imu[9] = 9 IMU channels
-// uint16_t checksum = 16-bit sum of all bytes except checksum
+// ===================== IMU =====================
+Adafruit_BNO055 bno(55, 0x29, &Wire);
+
+// ===================== Packet =====================
 #pragma pack(push, 1)
-struct SamplePacket {
-  uint16_t sync;
-  uint16_t index;
-  uint16_t adc[NUM_ADC_CH];
-  int16_t  imu[NUM_BNO055_CH];
-  uint16_t checksum;
+struct FramePacket {
+  uint16_t sync;             // 0xA55A
+  uint8_t  version;          // 1
+  uint8_t  type;             // 1 = FramePacket
+  uint16_t frame_seq;        // increments per frame (100 Hz)
+  uint32_t t_us;             // micros() at start of this frame
+  uint32_t adc_base_idx;     // index of first ADC sample in this frame (1kHz counter)
+
+  uint16_t adc[ADC_BLOCK][ADC_CH]; // 10x8 ADC samples
+
+  int16_t  imu[IMU_CH];      // acc/gyro/mag scaled by 100 (cached)
+
+  uint16_t crc16;            // CRC16-CCITT over all bytes except this field
 };
 #pragma pack(pop)
 
-static SamplePacket pkt;
-static uint16_t packetIndex = 0;
+static_assert(sizeof(FramePacket) == 194, "FramePacket size must be 194 bytes");
 
-uint16_t computeChecksum(const uint8_t* data, size_t len) {
-  uint32_t sum = 0;
+// ===================== CRC16-CCITT =====================
+// Polynomial 0x1021, init 0xFFFF (common CCITT-FALSE style)
+static inline uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
+  uint16_t crc = 0xFFFF;
   for (size_t i = 0; i < len; i++) {
-    sum += data[i];
-  }
-  return static_cast<uint16_t>(sum & 0xFFFF);
-}
-
-// Sampling task: waits for notification from T1 ISR, reads ADC channels and BNO055 sensor data,
-// and pushes the row into the circular FIFO.
-void samplingTask(void* pvParameters) {
-  for (;;) {
-    // Wait indefinitely for a notification from the ISR
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-    // Read data from both ADC channels and BNO055 sensor
-    sample_t row[NUM_CH];
-
-    // Read ADC channels first (channels 0-7)
-    const int chPins[NUM_ADC_CH] = {36, 39, 34, 35, 32, 33, 25, 26};
-    for (size_t i = 0; i < NUM_ADC_CH; ++i) {
-      row[i] = static_cast<sample_t>(analogRead(chPins[i]));
-    }
-
-    // Read BNO055 sensor data (channels 8-16)
-    sensors_event_t accelData, gyroData, magData;
-    bno.getEvent(&accelData, Adafruit_BNO055::VECTOR_ACCELEROMETER);
-    bno.getEvent(&gyroData, Adafruit_BNO055::VECTOR_GYROSCOPE);
-    bno.getEvent(&magData, Adafruit_BNO055::VECTOR_MAGNETOMETER);
-
-    // Convert to int16_t and store in buffer (multiply by 100 to preserve 2 decimal places)
-    row[8]  = static_cast<sample_t>(accelData.acceleration.x * 100);  // acc_x
-    row[9]  = static_cast<sample_t>(accelData.acceleration.y * 100);  // acc_y
-    row[10] = static_cast<sample_t>(accelData.acceleration.z * 100);  // acc_z
-    row[11] = static_cast<sample_t>(gyroData.gyro.x * 100);           // gyro_x
-    row[12] = static_cast<sample_t>(gyroData.gyro.y * 100);           // gyro_y
-    row[13] = static_cast<sample_t>(gyroData.gyro.z * 100);           // gyro_z
-    row[14] = static_cast<sample_t>(magData.magnetic.x * 100);        // mag_x
-    row[15] = static_cast<sample_t>(magData.magnetic.y * 100);        // mag_y
-    row[16] = static_cast<sample_t>(magData.magnetic.z * 100);        // mag_z
-
-    // Push into circular buffer
-    if (xSemaphoreTake(bufMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-      // Store all channels
-      for (size_t c = 0; c < NUM_CH; ++c) {
-        buffer[buf_head][c] = row[c];
-      }
-      buf_head = (buf_head + 1) % NUM_ROWS;
-      if (buf_count < NUM_ROWS) {
-        buf_count++;
-      } else {
-        // buffer full: advance tail to maintain FIFO
-        buf_tail = (buf_tail + 1) % NUM_ROWS;
-      }
-      xSemaphoreGive(bufMutex);
-    } else {
-      // Failed to get mutex; drop sample
+    crc ^= (uint16_t)data[i] << 8;
+    for (int b = 0; b < 8; b++) {
+      crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
     }
   }
+  return crc;
 }
 
-// Task: wait for print events and send binary packets from task context (safe for Serial).
-// When EVT_T2 is received, dequeue up to 2 rows and send them as binary packets.
-void printTask(void* pvParameters) {
-  uint8_t evt;
+// ===================== Shared IMU Cache =====================
+static sample_t imuCache[IMU_CH] = {0};
+static portMUX_TYPE imuMux = portMUX_INITIALIZER_UNLOCKED;
+
+// ===================== TX Queue =====================
+static QueueHandle_t txQueue = nullptr;
+static volatile uint32_t droppedTxPackets = 0;
+
+// Global counters
+static volatile uint32_t adcSampleIndex = 0; // increments at 1kHz
+static uint16_t frameSeq = 0;
+
+// ---------------- IMU task @ 100Hz ----------------
+// Only task that touches Wire/BNO055.
+void imuTask(void* pv) {
+  const TickType_t period = pdMS_TO_TICKS(1000 / IMU_HZ); // 10ms
+  TickType_t lastWake = xTaskGetTickCount();
+
+  const uint32_t magEvery = IMU_HZ / MAG_HZ; // 5
+  uint32_t imuTick = 0;
+
+  sensors_event_t a, g, m;
+
+  // cached mag
+  static sample_t mx = 0, my = 0, mz = 0;
+
   for (;;) {
-    if (xQueueReceive(printQueue, &evt, portMAX_DELAY) == pdTRUE) {
-      if (evt == EVT_T2) {
-        // Dequeue up to 2 rows
-        for (int r = 0; r < 2; ++r) {
-          bool haveRow = false;
-          sample_t row[NUM_CH];
-          if (xSemaphoreTake(bufMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            if (buf_count > 0) {
-              for (size_t c = 0; c < NUM_CH; ++c) {
-                row[c] = buffer[buf_tail][c];
-              }
-              buf_tail = (buf_tail + 1) % NUM_ROWS;
-              buf_count--;
-              haveRow = true;
-            }
-            xSemaphoreGive(bufMutex);
-          }
+    vTaskDelayUntil(&lastWake, period);
+    imuTick++;
 
-          if (haveRow) {
-            // Fill binary packet from row
-            pkt.sync  = 0xA55A;
-            pkt.index = packetIndex++;
+    bno.getEvent(&a, Adafruit_BNO055::VECTOR_ACCELEROMETER);
+    bno.getEvent(&g, Adafruit_BNO055::VECTOR_GYROSCOPE);
 
-            // ADC channels 0..7 → uint16_t
-            for (size_t i = 0; i < NUM_ADC_CH; ++i) {
-              pkt.adc[i] = static_cast<uint16_t>(row[i]);
-            }
-            // IMU channels 8..16 → int16_t
-            for (size_t i = 0; i < NUM_BNO055_CH; ++i) {
-              pkt.imu[i] = static_cast<int16_t>(row[NUM_ADC_CH + i]);
-            }
+    sample_t ax = (sample_t)lroundf(a.acceleration.x * 100.0f);
+    sample_t ay = (sample_t)lroundf(a.acceleration.y * 100.0f);
+    sample_t az = (sample_t)lroundf(a.acceleration.z * 100.0f);
 
-            // Compute checksum over all bytes except checksum field itself
-            pkt.checksum = computeChecksum(
-              reinterpret_cast<const uint8_t*>(&pkt),
-              sizeof(SamplePacket) - sizeof(pkt.checksum)
-            );
+    sample_t gx = (sample_t)lroundf(g.gyro.x * 100.0f);
+    sample_t gy = (sample_t)lroundf(g.gyro.y * 100.0f);
+    sample_t gz = (sample_t)lroundf(g.gyro.z * 100.0f);
 
-            // Send raw binary packet
-            Serial.write(reinterpret_cast<const uint8_t*>(&pkt), sizeof(SamplePacket));
-          } else {
-            // No data available: do NOT send "<no-data>" for binary stream
-            // Just skip this send opportunity.
-          }
+    if ((imuTick % magEvery) == 0) {
+      bno.getEvent(&m, Adafruit_BNO055::VECTOR_MAGNETOMETER);
+      mx = (sample_t)lroundf(m.magnetic.x * 100.0f);
+      my = (sample_t)lroundf(m.magnetic.y * 100.0f);
+      mz = (sample_t)lroundf(m.magnetic.z * 100.0f);
+    }
+
+    portENTER_CRITICAL(&imuMux);
+    imuCache[0] = ax; imuCache[1] = ay; imuCache[2] = az;
+    imuCache[3] = gx; imuCache[4] = gy; imuCache[5] = gz;
+    imuCache[6] = mx; imuCache[7] = my; imuCache[8] = mz;
+    portEXIT_CRITICAL(&imuMux);
+  }
+}
+
+// --------------- ADC task @ 1kHz (builds frames @100Hz) ---------------
+// Reads ADC every 1ms; every 10 samples => builds a FramePacket and enqueues it.
+void adcTask(void* pv) {
+  const TickType_t period = pdMS_TO_TICKS(1000 / ADC_HZ); // 1ms
+  TickType_t lastWake = xTaskGetTickCount();
+
+  uint16_t adcBlock[ADC_BLOCK][ADC_CH];
+  uint8_t  blockPos = 0;
+
+  uint32_t frameStartUs = 0;
+  uint32_t frameBaseIdx = 0;
+
+  for (;;) {
+    vTaskDelayUntil(&lastWake, period);
+
+    // start of a new 10ms frame
+    if (blockPos == 0) {
+      frameStartUs = (uint32_t)micros();
+      frameBaseIdx = adcSampleIndex; // index of the first sample in this frame
+    }
+
+    // Read 8 ADC channels
+    for (size_t ch = 0; ch < ADC_CH; ch++) {
+      adcBlock[blockPos][ch] = (uint16_t)analogRead(ADC_PINS[ch]);
+    }
+
+    adcSampleIndex++;
+    blockPos++;
+
+    // If we collected 10 samples -> build and queue a packet
+    if (blockPos >= ADC_BLOCK) {
+      blockPos = 0;
+
+      FramePacket p{};
+      p.sync = SYNC_WORD;
+      p.version = PKT_VER;
+      p.type = PKT_TYPE_FRAME;
+      p.frame_seq = frameSeq++;
+      p.t_us = frameStartUs;
+      p.adc_base_idx = frameBaseIdx;
+
+      // copy ADC block
+      for (uint8_t i = 0; i < ADC_BLOCK; i++) {
+        for (size_t ch = 0; ch < ADC_CH; ch++) {
+          p.adc[i][ch] = adcBlock[i][ch];
         }
       }
+
+      // copy cached IMU
+      portENTER_CRITICAL(&imuMux);
+      for (size_t i = 0; i < IMU_CH; i++) p.imu[i] = imuCache[i];
+      portEXIT_CRITICAL(&imuMux);
+
+      // CRC over everything except crc16 field
+      p.crc16 = crc16_ccitt((const uint8_t*)&p, sizeof(FramePacket) - sizeof(p.crc16));
+
+      // enqueue (don’t block; drop if full)
+      if (xQueueSend(txQueue, &p, 0) != pdTRUE) {
+        droppedTxPackets++;
+      }
+    }
+  }
+}
+
+// ---------------- TX task ----------------
+// Only place Serial.write happens.
+void txTask(void* pv) {
+  FramePacket p;
+  for (;;) {
+    if (xQueueReceive(txQueue, &p, portMAX_DELAY) == pdTRUE) {
+      Serial.write((const uint8_t*)&p, sizeof(FramePacket));
     }
   }
 }
 
 void setup() {
-  // Use 900,000 baud so we can sustain 1 kHz × 40 bytes = 40 kB/s
-  Serial.begin(900000);
-  delay(500);
-
-  // Initialize I2C for BNO055 on pins 21 (SDA) and 22 (SCL)
-  Wire.begin(21, 22);
-  Wire.setClock(400000); // Set I2C frequency to 400kHz
+  Serial.begin(SERIAL_BAUD);
   delay(100);
+  Serial.setTxBufferSize(8192);
 
-  // Initialize BNO055 sensor using Adafruit library
-  if (!bno.begin()) {
-    Serial.println("Failed to initialize BNO055 sensor");
-    Serial.println("Check wiring and I2C address (0x29)");
-    // Continue anyway, but sensor readings will be invalid
-  } else {
-    Serial.println("BNO055 initialized successfully");
-    delay(1000);
-    bno.setExtCrystalUse(true); // Use external crystal for better accuracy
-  }
+  // ADC settings
+  analogReadResolution(12); // 0..4095
+  // If your input range needs it:
+  // analogSetAttenuation(ADC_11db);
 
-  // Create a queue that can hold up to 16 uint8_t event IDs
-  printQueue = xQueueCreate(16, sizeof(uint8_t));
-  if (printQueue == NULL) {
-    Serial.println("Failed to create printQueue");
-  } else {
-    xTaskCreate(printTask, "printTask", 2048, NULL, 1, NULL);
-  }
+  // I2C + IMU
+  Wire.begin(21, 22);
+  Wire.setClock(I2C_HZ);
+  delay(50);
 
-  // Create buffer mutex
-  bufMutex = xSemaphoreCreateMutex();
-  if (bufMutex == NULL) {
-    Serial.println("Failed to create bufMutex");
-  }
+  bool ok = bno.begin();
+  delay(20);
+  if (ok) bno.setExtCrystalUse(true);
 
-  // Create sampling task (it will block waiting for notifications)
-  BaseType_t r = xTaskCreate(samplingTask, "samplingTask", 4096, NULL, 2, &samplingTaskHandle);
-  if (r != pdPASS) {
-    Serial.println("Failed to create samplingTask");
-    samplingTaskHandle = NULL;
-  }
+  txQueue = xQueueCreate(TX_QUEUE_LEN, sizeof(FramePacket));
 
-  timer1 = timerBegin(0, TIMER_PRESCALER, true);
-  timerAttachInterrupt(timer1, &T1_callback, true);
-  timerAlarmWrite(timer1, T1_PERIOD_US, true);
-  timerAlarmEnable(timer1);
-
-  timer2 = timerBegin(1, TIMER_PRESCALER, true);
-  timerAttachInterrupt(timer2, &T2_callback, true);
-  timerAlarmWrite(timer2, T2_PERIOD_US, true);
-  timerAlarmEnable(timer2);
+  // Core pinning / priorities:
+  // ADC task (1kHz) gets highest prio to reduce jitter.
+  xTaskCreatePinnedToCore(adcTask, "adcTask", 4096, NULL, 4, NULL, 1);
+  xTaskCreatePinnedToCore(imuTask, "imuTask", 4096, NULL, 3, NULL, 0);
+  xTaskCreatePinnedToCore(txTask,  "txTask",  4096, NULL, 2, NULL, 0);
 }
 
-void loop() {
-  // Nothing to do in loop; sampling + sending handled by FreeRTOS tasks.
-  // delay(1000);
-}
+void loop() {}
