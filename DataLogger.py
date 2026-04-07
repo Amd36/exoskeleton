@@ -3,25 +3,26 @@ DataLogger.py
 -------------
 A class for real-time serial data acquisition and buffering.
 
-UPDATED for new binary FRAME protocol (Option A):
+Updated for the DAQ_System binary FRAME protocol:
 
-FramePacket (little-endian, 194 bytes total):
+FramePacket (little-endian, 112 bytes total):
 
 uint16_t sync        = 0xA55A
 uint8_t  version     = 1
 uint8_t  type        = 1  (FramePacket)
 uint16_t frame_seq   = increments @ 100 Hz
 uint32_t t_us        = micros() at start of frame
-uint32_t adc_base_idx= index of first ADC sample in this frame (1 kHz counter)
+uint32_t adc_base_idx= index of first ADC sample in this frame (500 Hz counter)
 
-uint16_t adc[10][8]  = 10 samples (1 ms apart) x 8 channels
-int16_t  imu[9]      = accel/gyro/mag (scaled x100), cached; mag updates @20Hz
+uint16_t adc[5][6]   = 5 samples (2 ms apart) x 6 channels
+int16_t  imu[18]     = two BNO055 IMUs; acc/gyro/mag for each, scaled x100
 
 uint16_t crc16       = CRC16-CCITT (poly 0x1021, init 0xFFFF) over all bytes except crc16
 
 Behavior:
-- Each received frame expands into 10 "rows" pushed to the queue.
-- Each row is: (adc_sample_index, [adc1..adc8, imu1..imu9])  -> 17 values like before.
+- Each received frame expands into 5 "rows" pushed to the queue.
+- Each row is: (adc_sample_index, [adc1..adc6, imu0_9axis, imu1_9axis]).
+- ADC values are raw 12-bit counts. IMU values are converted to physical units by dividing by 100.
 """
 
 import serial
@@ -35,10 +36,48 @@ import time
 
 
 class DataLogger:
+    SYNC_WORD = 0xA55A
+    SYNC_BYTES = struct.pack("<H", SYNC_WORD)
+    PKT_VER = 1
+    PKT_TYPE_FRAME = 1
+
+    ADC_RATE_HZ = 500.0
+    FRAME_RATE_HZ = 100.0
+    ADC_BLOCK = 5
+    ADC_CH = 6
+    IMU_COUNT = 2
+    IMU_CH_PER_SENSOR = 9
+    IMU_CH = IMU_COUNT * IMU_CH_PER_SENSOR
+    IMU_SCALE = 100.0
+    TOTAL_CHANNELS = ADC_CH + IMU_CH
+
+    ADC_CHANNEL_NAMES = (
+        "adc0_gpio36",
+        "adc1_gpio39",
+        "adc2_gpio34",
+        "adc3_gpio35",
+        "adc4_gpio32",
+        "adc5_gpio33",
+    )
+    IMU_AXIS_NAMES = ("acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z", "mag_x", "mag_y", "mag_z")
+    CHANNEL_NAMES = list(ADC_CHANNEL_NAMES)
+    for _imu_idx in range(IMU_COUNT):
+        for _axis in IMU_AXIS_NAMES:
+            CHANNEL_NAMES.append(f"imu{_imu_idx}_{_axis}")
+    del _imu_idx, _axis
+    PACKET_STRUCT = struct.Struct("<HBBHII30H18hH")
+    PACKET_SIZE = PACKET_STRUCT.size
+
     def __init__(self, port, baud_rate, num_channels, buffer_length=20000, samples_per_event=2):
         self.port = port
         self.baud_rate = baud_rate
-        self.num_channels = num_channels
+        if num_channels != self.TOTAL_CHANNELS:
+            print(
+                f"Warning: num_channels={num_channels}, but current DAQ protocol expands to "
+                f"{self.TOTAL_CHANNELS} values per ADC sample ({self.ADC_CH} ADC + {self.IMU_CH} IMU). "
+                f"Using {self.TOTAL_CHANNELS} channels."
+            )
+        self.num_channels = self.TOTAL_CHANNELS
         self.buffer_length = buffer_length
         self.samples_per_event = samples_per_event
 
@@ -46,7 +85,7 @@ class DataLogger:
 
         self.channels = [
             deque([0] * buffer_length, maxlen=buffer_length)
-            for _ in range(num_channels)
+            for _ in range(self.num_channels)
         ]
 
         # Now stores ADC sample indices (32-bit-ish, Python int)
@@ -55,28 +94,11 @@ class DataLogger:
         self.reader_thread = None
         self.reader_stop = threading.Event()
         self.serial_connection = None
+        self.invalid_packets = 0
+        self.valid_frames = 0
 
-        # --- Binary protocol configuration ---
-        self.SYNC_WORD = 0xA55A
-        self.SYNC_BYTES = struct.pack("<H", self.SYNC_WORD)
-
-        self.PKT_VER = 1
-        self.PKT_TYPE_FRAME = 1
-        self.ADC_BLOCK = 10
-        self.ADC_CH = 8
-        self.IMU_CH = 9
-
-        # Struct:
-        # < H B B H I I 80H 9h H
-        # sync, ver, type, frame_seq, t_us, adc_base_idx, adc[80], imu[9], crc16
-        self.PACKET_STRUCT = struct.Struct("<HBBHII80H9hH")
-        self.PACKET_SIZE = self.PACKET_STRUCT.size  # 194
-
-        if self.num_channels != 17:
-            print(
-                f"Warning: num_channels={self.num_channels}, but protocol expands to 17 values per ADC sample "
-                f"(8 ADC + 9 IMU)."
-            )
+        if self.PACKET_SIZE != 112:
+            raise RuntimeError(f"Unexpected packet size: {self.PACKET_SIZE} bytes")
 
     # ---------- CRC16 (must match ESP32) ----------
 
@@ -97,7 +119,7 @@ class DataLogger:
 
     def _parse_frame_packet(self, packet_bytes: bytes):
         """
-        Parse a 194-byte FramePacket and EXPAND into 10 rows.
+        Parse one 112-byte FramePacket and expand it into 5 ADC-sample rows.
 
         Returns:
             list[(index:int, values:list[float])] or None
@@ -126,17 +148,19 @@ class DataLogger:
 
         # fields layout:
         # 0:sync, 1:ver, 2:type, 3:frame_seq, 4:t_us, 5:adc_base_idx,
-        # 6..(6+79): adc flat (80 vals),
-        # next 9: imu,
-        # last: crc
-        frame_seq   = fields[3]
-        t_us        = fields[4]
+        # 6..35: adc flat (30 uint16 = 5 rows x 6 channels),
+        # 36..53: imu flat (18 int16 = 2 IMUs x 9 channels),
+        # 54: crc16
+        frame_seq = fields[3]
+        t_us = fields[4]
         adc_base_idx = fields[5]
 
-        adc_flat = fields[6:6 + (self.ADC_BLOCK * self.ADC_CH)]  # 80 uint16
-        imu_vals = fields[6 + (self.ADC_BLOCK * self.ADC_CH): 6 + (self.ADC_BLOCK * self.ADC_CH) + self.IMU_CH]
+        adc_count = self.ADC_BLOCK * self.ADC_CH
+        adc_flat = fields[6:6 + adc_count]
+        imu_raw = fields[6 + adc_count: 6 + adc_count + self.IMU_CH]
+        imu_vals = [raw / self.IMU_SCALE for raw in imu_raw]
 
-        # Expand into 10 rows: each row keeps 8 ADC + same IMU cache
+        # Expand into 5 rows: each ADC sample keeps the frame's latest cached IMU sample.
         rows = []
         for i in range(self.ADC_BLOCK):
             base = i * self.ADC_CH
@@ -144,14 +168,9 @@ class DataLogger:
             values = list(adc_vals) + list(imu_vals)
 
             if len(values) != self.num_channels:
-                # If user configured different num_channels, refuse malformed
-                if self.num_channels != 17:
-                    # allow truncate/extend? safer to discard
-                    return None
                 return None
 
-            sample_index = int(adc_base_idx + i)  # 1kHz timeline index
-            # Convert to floats for compatibility with existing plotting/saving code
+            sample_index = int(adc_base_idx + i)
             rows.append((sample_index, [float(v) for v in values]))
 
         return rows
@@ -198,13 +217,16 @@ class DataLogger:
                         break
 
                     packet = bytes(buf[:self.PACKET_SIZE])
-                    del buf[:self.PACKET_SIZE]
-
                     rows = self._parse_frame_packet(packet)
                     if rows is None:
+                        self.invalid_packets += 1
+                        del buf[:1]
                         continue
 
-                    # push 10 expanded rows
+                    del buf[:self.PACKET_SIZE]
+                    self.valid_frames += 1
+
+                    # push expanded rows
                     for row in rows:
                         try:
                             self.row_queue.put_nowait(row)
@@ -250,19 +272,17 @@ class DataLogger:
 
     # ---------- Queue + buffer handling ----------
 
-    def read_event(self):
-        rows = []
-        for _ in range(self.samples_per_event):
-            try:
-                rows.append(self.row_queue.get_nowait())
-            except queue.Empty:
-                break
-        return rows
+    def drain_rows(self, max_rows=None, update_buffers=True):
+        """
+        Drain parsed rows from the serial-reader queue.
 
-    def update_buffers(self):
-        drained = 0
+        This keeps parsing centralized in DataLogger while letting UI callers
+        capture the exact rows that were added during a save window.
+        """
+        rows = []
+
         try:
-            while True:
+            while max_rows is None or len(rows) < max_rows:
                 try:
                     item = self.row_queue.get_nowait()
                 except queue.Empty:
@@ -276,15 +296,29 @@ class DataLogger:
                 if len(row) != self.num_channels:
                     continue
 
-                self.indices.append(index)
-                for c in range(self.num_channels):
-                    self.channels[c].append(row[c])
-                drained += 1
+                if update_buffers:
+                    self.indices.append(index)
+                    for c in range(self.num_channels):
+                        self.channels[c].append(row[c])
+
+                rows.append((index, row))
 
         except Exception as e:
-            print("Error in update_buffers:", e)
+            print("Error in drain_rows:", e)
 
-        return drained
+        return rows
+
+    def read_event(self):
+        rows = []
+        for _ in range(self.samples_per_event):
+            try:
+                rows.append(self.row_queue.get_nowait())
+            except queue.Empty:
+                break
+        return rows
+
+    def update_buffers(self):
+        return len(self.drain_rows(update_buffers=True))
 
     def get_channel_data(self, channel_index, max_points=None):
         if channel_index >= self.num_channels:
@@ -304,18 +338,45 @@ class DataLogger:
         return [self.get_channel_data(i, max_points) for i in range(self.num_channels)]
 
     def get_adc_data(self, max_points=None):
-        adc_channels = min(8, self.num_channels)
+        adc_channels = min(self.ADC_CH, self.num_channels)
         return [self.get_channel_data(i, max_points) for i in range(adc_channels)]
 
-    def get_imu_data(self, max_points=None):
-        if self.num_channels < 17:
-            return {'accelerometer': [], 'gyroscope': [], 'magnetometer': []}
+    def get_channel_names(self):
+        return list(self.CHANNEL_NAMES[:self.num_channels])
+
+    def _get_single_imu_data(self, imu_index, max_points=None):
+        if not 0 <= imu_index < self.IMU_COUNT:
+            raise ValueError(f"imu_index must be 0..{self.IMU_COUNT - 1}")
+
+        start = self.ADC_CH + (imu_index * self.IMU_CH_PER_SENSOR)
+        return {
+            'accelerometer': [self.get_channel_data(start + i, max_points) for i in range(3)],
+            'gyroscope': [self.get_channel_data(start + 3 + i, max_points) for i in range(3)],
+            'magnetometer': [self.get_channel_data(start + 6 + i, max_points) for i in range(3)]
+        }
+
+    def get_imu_data(self, max_points=None, imu_index=None):
+        """
+        Return IMU plot data grouped by sensor.
+
+        If imu_index is None, returns {'imu0': {...}, 'imu1': {...}} and also includes
+        legacy top-level accelerometer/gyroscope/magnetometer aliases for IMU0.
+        """
+        if self.num_channels < self.TOTAL_CHANNELS:
+            return {'imu0': {}, 'imu1': {}, 'accelerometer': [], 'gyroscope': [], 'magnetometer': []}
+
+        if imu_index is not None:
+            return self._get_single_imu_data(imu_index, max_points)
 
         imu_data = {
-            'accelerometer': [self.get_channel_data(8 + i, max_points) for i in range(3)],
-            'gyroscope':     [self.get_channel_data(11 + i, max_points) for i in range(3)],
-            'magnetometer':  [self.get_channel_data(14 + i, max_points) for i in range(3)]
+            f'imu{i}': self._get_single_imu_data(i, max_points)
+            for i in range(self.IMU_COUNT)
         }
+
+        # Backward-compatible aliases for callers that only plotted one IMU before.
+        imu_data['accelerometer'] = imu_data['imu0']['accelerometer']
+        imu_data['gyroscope'] = imu_data['imu0']['gyroscope']
+        imu_data['magnetometer'] = imu_data['imu0']['magnetometer']
         return imu_data
 
     def clear_buffers(self):
@@ -331,6 +392,13 @@ class DataLogger:
     def get_queue_size(self):
         return self.row_queue.qsize()
 
+    def get_reader_stats(self):
+        return {
+            "valid_frames": self.valid_frames,
+            "invalid_packets": self.invalid_packets,
+            "queued_rows": self.get_queue_size()
+        }
+
     def is_logging(self):
         return (
             self.reader_thread is not None and
@@ -340,9 +408,10 @@ class DataLogger:
 
     def read_exact_packets(self, target_packets, timeout=0.05, max_runtime_s=30.0):
         """
-        NOTE (updated meaning):
-        - target_packets = number of *frames* to capture (each frame expands to 10 samples).
-        - returned 'data' length will be target_packets * 10 (unless timeout).
+        Capture target_packets wire frames.
+
+        Each current DAQ frame expands to 5 ADC samples, so returned 'data' length
+        should be target_packets * 5 unless capture times out.
         """
         try:
             ser = serial.Serial(self.port, self.baud_rate, timeout=timeout)
@@ -353,7 +422,7 @@ class DataLogger:
         buf = bytearray()
         indices = []
         data = []
-        bad_crc = 0
+        invalid_packets = 0
         total_bytes = 0
         frames = 0
 
@@ -387,13 +456,13 @@ class DataLogger:
                         break
 
                     pkt = bytes(buf[:self.PACKET_SIZE])
-                    del buf[:self.PACKET_SIZE]
-
                     rows = self._parse_frame_packet(pkt)
                     if rows is None:
-                        bad_crc += 1
+                        invalid_packets += 1
+                        del buf[:1]
                         continue
 
+                    del buf[:self.PACKET_SIZE]
                     frames += 1
                     for idx, values in rows:
                         indices.append(idx)
@@ -408,7 +477,8 @@ class DataLogger:
         stats = {
             "valid_frames": frames,
             "expanded_samples": len(data),
-            "bad_crc_frames": bad_crc,
+            "invalid_packets": invalid_packets,
+            "bad_crc_frames": invalid_packets,
             "bytes_read": total_bytes,
             "elapsed_s": time.time() - t0
         }
@@ -442,7 +512,7 @@ class DataLogger:
             'is_continuous': missing == 0
         }
 
-    # ---------- Saving (unchanged) ----------
+    # ---------- Saving ----------
 
     def save_data(
         self,
@@ -450,7 +520,7 @@ class DataLogger:
         file_extension=".csv",
         save_directory=".saved_data",
         skip_initial_zeros=True,
-        sample_rate=1000.0,
+        sample_rate=ADC_RATE_HZ,
         timestamp_start=0.0,
         combined=False,
         include_indices=False,
@@ -486,11 +556,8 @@ class DataLogger:
             index_array = np.array(indices_data)
 
         channel_map = {
-            1: 'piezo1', 2: 'piezo2', 3: 'piezo3', 4: 'piezo4',
-            5: 'piezo5', 6: 'piezo6', 7: 'fsr1', 8: 'fsr2',
-            9: 'acc_x', 10: 'acc_y', 11: 'acc_z',
-            12: 'gyro_x', 13: 'gyro_y', 14: 'gyro_z',
-            15: 'mag_x', 16: 'mag_y', 17: 'mag_z'
+            idx + 1: name
+            for idx, name in enumerate(self.get_channel_names())
         }
 
         if combined:
@@ -524,7 +591,10 @@ class DataLogger:
                     header_parts.append('index')
 
                 columns.extend(aligned)
-                header_parts.extend([channel_map[idx + 1] for idx in range(self.num_channels)])
+                header_parts.extend([
+                    channel_map.get(idx + 1, f"channel_{idx + 1}")
+                    for idx in range(self.num_channels)
+                ])
 
                 data_matrix = np.column_stack(columns)
                 filename = f"{filename_prefix}_all{file_extension}"
@@ -550,7 +620,8 @@ class DataLogger:
             else:
                 timestamps = (np.arange(n) / float(sample_rate)) + float(timestamp_start)
 
-            filename = f"{filename_prefix}{channel_map[channel_idx + 1]}{file_extension}"
+            channel_name = channel_map.get(channel_idx + 1, f"channel_{channel_idx + 1}")
+            filename = f"{filename_prefix}{channel_name}{file_extension}"
             filepath = os.path.join(save_directory, filename)
 
             try:
