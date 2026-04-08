@@ -1,0 +1,22 @@
+----------------------------------------------------------------------------------------------------------------------------------
+NCDrill File Report For: TaruPCB.PcbDoc   4/8/2026  6:41:58 PM
+----------------------------------------------------------------------------------------------------------------------------------
+
+Layer Pair : Top Layer to Bottom Layer
+ASCII Plated RoundHoles File : TaruPCB-Plated.TXT
+
+Tool       Hole Size               Hole Tolerance               Hole Type       Hole Count   Plated         Tool Travel
+----------------------------------------------------------------------------------------------------------------------------------
+T1      25mil (0.635mm)                                           Round             4         PTH        0.89inch (22.73mm)
+T2      30mil (0.762mm)                                           Round             4         PTH        0.45inch (11.45mm)
+T3      32mil (0.8mm)                                             Round             4         PTH        0.45inch (11.31mm)
+T4      34mil (0.864mm)                                           Round             8         PTH        2.65inch (67.26mm)
+T5      39mil (1mm)                                               Round             18        PTH        4.13inch (104.96mm)
+T6      40mil (1.016mm)                                           Round             113       PTH        39.37inch (1000.11mm)
+T7      40mil (1.02mm)                                            Round             46        PTH        8.86inch (225.10mm)
+T8      43mil (1.092mm)                                           Round             16        PTH        4.87inch (123.75mm)
+T9      118mil (3mm)                                              Round             4         PTH        11.90inch (302.26mm)
+----------------------------------------------------------------------------------------------------------------------------------
+Totals                                                                              217
+
+Total Processing Time (hh:mm:ss) : 00:00:00
