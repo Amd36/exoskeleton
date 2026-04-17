@@ -1,13 +1,14 @@
 #Requires AutoHotkey v2.0
-#SingleInstance Force
+#SingleInstance Off
 
 SetTitleMatchMode 2
 DetectHiddenWindows false
 CoordMode "Mouse", "Screen"
 
 global LOG_FILE := A_ScriptDir "\opengrf_automation.log"
+global CLAIM_ROOT := A_ScriptDir "\window_claims"
+global METADATA_BASE_DIR := A_ScriptDir
 global KNOWN_TITLES := Map(
-    "MATLAB R2025a", true,
     "Choose MSK model", true,
     "Choose IK Result file", true,
     "Input data", true
@@ -17,12 +18,30 @@ global RUNTIME := ParseRuntimeArgs()
 Main()
 
 Main() {
+    global LOG_FILE
+    global CLAIM_ROOT
+    global METADATA_BASE_DIR
     global RUNTIME
+
     runtime := RUNTIME
+    metaPath := runtime["metadata_path"] != "" ? NormalizeCliPath(runtime["metadata_path"]) : A_ScriptDir "\opengrf_metadata.json"
+    if runtime["log_path"] != ""
+        LOG_FILE := NormalizeCliPath(runtime["log_path"])
+    if runtime["claim_root"] != ""
+        CLAIM_ROOT := NormalizeCliPath(runtime["claim_root"])
+
+    EnsureParentDir(LOG_FILE)
+    if !DirExist(CLAIM_ROOT)
+        DirCreate(CLAIM_ROOT)
+
     try {
-        metaPath := A_ScriptDir "\opengrf_metadata.json"
         if !FileExist(metaPath)
             throw Error("Metadata file not found: " metaPath)
+
+        metaName := ""
+        SplitPath(metaPath, &metaName, &metaDir)
+        if (metaDir != "")
+            METADATA_BASE_DIR := metaDir
 
         meta := LoadMetadata(metaPath)
         NormalizeMetadata(meta)
@@ -35,56 +54,74 @@ Main() {
         ValidateMetadata(meta)
 
         Log("Loaded metadata from: " metaPath)
+        Log("Worker ID: " runtime["worker_id"])
+        Log("MATLAB PID: " runtime["matlab_pid"])
         Log("OSIM: " meta["osim"])
         Log("MOT : " meta["mot"])
 
-        RunWatcher(meta)
+        RunWatcher(meta, runtime["matlab_pid"] + 0)
 
+        Log("Automation sequence completed.")
         if !runtime["silent"]
             MsgBox("OpenGRF automation steps completed.", "OpenGRF Automation")
+        ExitApp(0)
     } catch as err {
         Log("ERROR: " err.Message)
         if !runtime["silent"]
             MsgBox(err.Message, "OpenGRF Automation Error", "Iconx")
+        ExitApp(1)
     }
 }
 
-RunWatcher(meta) {
+RunWatcher(meta, matlabPid) {
     timeoutMs := meta["watch_timeout_sec"] * 1000
 
-    WaitForWindowByTitle("Choose MSK model", timeoutMs)
+    modelDialog := WaitForWindowByTitle("Choose MSK model", timeoutMs, matlabPid)
     Log("Detected Choose MSK model dialog.")
-    SelectFileInDialog("Choose MSK model", meta["osim"])
+    SelectFileInDialog(modelDialog, meta["osim"])
 
-    WaitForWindowByTitle("Choose IK Result file", timeoutMs)
+    motDialog := WaitForWindowByTitle("Choose IK Result file", timeoutMs, matlabPid)
     Log("Detected Choose IK Result file dialog.")
-    SelectFileInDialog("Choose IK Result file", meta["mot"])
+    SelectFileInDialog(motDialog, meta["mot"])
 
-    WaitForWindowByTitle("Input data", timeoutMs)
+    inputDialog := WaitForWindowByTitle("Input data", timeoutMs, matlabPid)
     Log("Detected Input data dialog.")
-    FillInputDialog("Input data", meta["start_time"], meta["end_time"], meta["penetration"])
+    FillInputDialog(inputDialog, meta["start_time"], meta["end_time"], meta["penetration"])
 
-    ; Let the frequency popup fully appear, then confirm it directly.
-    Sleep(2000)
-    if meta["estimate_frequency_content"] {
-        Send("{Enter}")
-        Log("Frequency popup handled with fixed 2-second wait + Enter.")
-    } else {
-        Send("{Tab}{Enter}")
-        Log("Frequency popup handled with fixed 2-second wait + Tab+Enter.")
-    }
+    HandleFrequencyPopup(meta["estimate_frequency_content"])
+
     Sleep(meta["post_yes_wait_ms"])
-
-    Log("Automation sequence completed.")
 }
 
-SelectFileInDialog(title, fullPath) {
+HandleFrequencyPopup(useYes) {
+    ; This popup appears immediately after the input dialog closes.
+    ; Startup is serialized, so sending the confirmation key directly is reliable.
+    Sleep(2000)
+
+    activeHwnd := WinExist("A")
+    if activeHwnd {
+        try WinActivate("ahk_id " activeHwnd)
+        catch {
+        }
+    }
+    Sleep(200)
+
+    if useYes {
+        Send("{Enter}")
+        Log("Frequency popup handled with fixed wait + Enter.")
+    } else {
+        Send("{Tab}{Enter}")
+        Log("Frequency popup handled with fixed wait + Tab+Enter.")
+    }
+}
+
+SelectFileInDialog(hwnd, fullPath) {
     if !FileExist(fullPath)
         throw Error("File does not exist: " fullPath)
 
     SplitPath(fullPath, &fileName, &dirPath)
+    winSpec := "ahk_id " hwnd
 
-    winSpec := title
     WinActivate(winSpec)
     WinWaitActive(winSpec, "", 5)
     Sleep(250)
@@ -115,7 +152,7 @@ SelectFileInDialog(title, fullPath) {
     Sleep(700)
 
     if WinExist(winSpec)
-        throw Error("Failed to close file dialog: " title)
+        throw Error("Failed to close file dialog: " SafeWinTitle(hwnd))
 }
 
 TrySetFileName(winSpec, fullPath) {
@@ -144,8 +181,8 @@ TrySetFileName(winSpec, fullPath) {
     return false
 }
 
-FillInputDialog(title, startTime, endTime, penetration) {
-    winSpec := title
+FillInputDialog(hwnd, startTime, endTime, penetration) {
+    winSpec := "ahk_id " hwnd
     WinActivate(winSpec)
     WinWaitActive(winSpec, "", 5)
     Sleep(250)
@@ -157,7 +194,7 @@ FillInputDialog(title, startTime, endTime, penetration) {
 
     if okDirect {
         if TryPressOk(winSpec) {
-            WaitForWindowClose(title, 5000)
+            WaitForWindowClose(hwnd, 5000)
             return
         }
     }
@@ -189,7 +226,7 @@ FillInputDialog(title, startTime, endTime, penetration) {
     Sleep(150)
 
     Send("{Enter}")
-    WaitForWindowClose(title, 5000)
+    WaitForWindowClose(hwnd, 5000)
 }
 
 TrySetEdit(ctrl, value, winSpec) {
@@ -225,22 +262,18 @@ TryPressOk(winSpec) {
     }
 }
 
-TryHandleFrequencyPopup(useYes, timeoutMs) {
+TryHandleFrequencyPopup(useYes, timeoutMs, matlabPid) {
     deadline := A_TickCount + timeoutMs
     seenInputDisappear := false
 
     while (A_TickCount < deadline) {
-        if !WinExist("Input data")
+        if !FindWindowForMatlab("Input data", matlabPid)
             seenInputDisappear := true
 
         if seenInputDisappear {
-            hwnd := WinExist("A")
-            if hwnd && IsLikelyDecisionDialog(hwnd) {
-                HandlePopupByKeys(hwnd, useYes)
-                return true
-            }
-
             for hwnd in WinGetList() {
+                if !WindowBelongsToMatlab(hwnd, matlabPid)
+                    continue
                 if IsLikelyDecisionDialog(hwnd) {
                     HandlePopupByKeys(hwnd, useYes)
                     return true
@@ -293,11 +326,9 @@ IsLikelyDecisionDialog(hwnd) {
     catch
         return false
 
-    ; The popup in your screenshot is a small dialog, not a full app window.
     if !(w >= 250 && w <= 1000 && h >= 120 && h <= 500)
         return false
 
-    ; Must have button-like controls
     if !HasButtonLikeControl(winSpec)
         return false
 
@@ -317,21 +348,147 @@ HasButtonLikeControl(winSpec) {
     return false
 }
 
-WaitForWindowByTitle(title, timeoutMs) {
+WaitForWindowByTitle(title, timeoutMs, matlabPid) {
     deadline := A_TickCount + timeoutMs
     while (A_TickCount < deadline) {
-        hwnd := WinExist(title)
+        hwnd := FindWindowForMatlab(title, matlabPid)
         if hwnd
             return hwnd
         Sleep(100)
     }
-    throw Error("Timed out waiting for '" title "' dialog.")
+    Log("Timed out waiting for '" title "'. " DescribeCandidates(title))
+    throw Error("Timed out waiting for '" title "' dialog for MATLAB PID " matlabPid ".")
 }
 
-WaitForWindowClose(title, timeoutMs) {
+FindWindowForMatlab(title, matlabPid) {
+    for hwnd in WinGetList(title) {
+        if WindowBelongsToMatlab(hwnd, matlabPid) && TryClaimWindow(hwnd, title)
+            return hwnd
+    }
+
+    activeHwnd := WinExist("A")
+    if activeHwnd && TitleMatches(activeHwnd, title) && TryClaimWindow(activeHwnd, title)
+        return activeHwnd
+
+    windows := WinGetList(title)
+    if (windows.Length = 1) {
+        hwnd := windows[1]
+        if TryClaimWindow(hwnd, title)
+            return hwnd
+    }
+
+    for hwnd in windows {
+        if TryClaimWindow(hwnd, title)
+            return hwnd
+    }
+    return 0
+}
+
+TryClaimWindow(hwnd, title) {
+    global CLAIM_ROOT
+    global RUNTIME
+
+    if !hwnd
+        return false
+
+    claimDir := CLAIM_ROOT "\" SanitizeClaimKey(title) "_" hwnd
+    ownerFile := claimDir "\owner.txt"
+    workerId := RUNTIME["worker_id"] != "" ? RUNTIME["worker_id"] : "worker"
+
+    if DirExist(claimDir) {
+        if FileExist(ownerFile) {
+            try existing := Trim(FileRead(ownerFile, "UTF-8"))
+            catch
+                existing := ""
+            if (existing = workerId)
+                return true
+        }
+        return false
+    }
+
+    try {
+        DirCreate(claimDir)
+        FileAppend(workerId, ownerFile, "UTF-8")
+        Log("Claimed '" title "' window hwnd=" hwnd " via fallback routing.")
+        return true
+    } catch {
+        return false
+    }
+}
+
+TitleMatches(hwnd, expectedTitle) {
+    try title := WinGetTitle("ahk_id " hwnd)
+    catch
+        return false
+
+    return InStr(title, expectedTitle) > 0
+}
+
+SanitizeClaimKey(text) {
+    cleaned := RegExReplace(text, "[^A-Za-z0-9]+", "_")
+    return cleaned != "" ? cleaned : "window"
+}
+
+DescribeCandidates(title) {
+    windows := WinGetList(title)
+    if (windows.Length = 0)
+        return "No matching windows were visible."
+
+    parts := []
+    for hwnd in windows {
+        pid := 0
+        try pid := WinGetPID("ahk_id " hwnd)
+        catch
+            pid := 0
+        parts.Push("hwnd=" hwnd " pid=" pid " title='" SafeWinTitle(hwnd) "'")
+    }
+    return "Candidates: " ArrayToJoinedString(parts)
+}
+
+ArrayToJoinedString(parts) {
+    text := ""
+    for index, part in parts {
+        if (index > 1)
+            text .= "; "
+        text .= part
+    }
+    return text
+}
+
+WindowBelongsToMatlab(hwnd, matlabPid) {
+    if (matlabPid <= 0)
+        return true
+
+    winSpec := "ahk_id " hwnd
+    try {
+        if (WinGetPID(winSpec) = matlabPid)
+            return true
+    } catch {
+    }
+
+    owner := GetOwnerHwnd(hwnd)
+    while owner {
+        ownerSpec := "ahk_id " owner
+        try {
+            if (WinGetPID(ownerSpec) = matlabPid)
+                return true
+        } catch {
+        }
+        owner := GetOwnerHwnd(owner)
+    }
+
+    return false
+}
+
+GetOwnerHwnd(hwnd) {
+    return DllCall("GetWindow", "ptr", hwnd, "uint", 4, "ptr")
+}
+
+WaitForWindowClose(hwnd, timeoutMs) {
+    winSpec := "ahk_id " hwnd
     deadline := A_TickCount + timeoutMs
     while (A_TickCount < deadline) {
-        if !WinExist(title)
+        if !WinExist(winSpec)
             return true
         Sleep(100)
     }
@@ -340,9 +497,8 @@ WaitForWindowClose(title, timeoutMs) {
 
 NormalizeMetadata(meta) {
     for _, key in ["opengrf_folder", "osim", "mot"] {
-        if meta.Has(key) {
+        if meta.Has(key)
             meta[key] := NormalizePathValue(meta[key])
-        }
     }
 }
 
@@ -367,7 +523,21 @@ ValidateMetadata(meta) {
         meta["post_yes_wait_ms"] := 2000
 }
 
+NormalizeCliPath(pathValue) {
+    val := Trim(String(pathValue))
+    if (val = "")
+        return val
+
+    val := StrReplace(val, "/", "\")
+    if RegExMatch(val, "^[A-Za-z]:\\") || SubStr(val, 1, 2) = "\\"
+        return val
+
+    return A_ScriptDir "\" val
+}
+
 NormalizePathValue(pathValue) {
+    global METADATA_BASE_DIR
+
     val := Trim(String(pathValue))
     if (val = "")
         return val
@@ -377,7 +547,7 @@ NormalizePathValue(pathValue) {
     if RegExMatch(val, "^[A-Za-z]:\\") || SubStr(val, 1, 2) = "\\"
         return val
 
-    return A_ScriptDir "\" val
+    return METADATA_BASE_DIR "\" val
 }
 
 LoadMetadata(path) {
@@ -433,14 +603,36 @@ ParseRuntimeArgs() {
         "silent", false,
         "mot_path", "",
         "start_time", "",
-        "end_time", ""
+        "end_time", "",
+        "metadata_path", "",
+        "log_path", "",
+        "claim_root", "",
+        "matlab_pid", 0,
+        "worker_id", ""
     )
 
     positionalIndex := 0
-    for _, arg in A_Args {
-        if (arg = "--silent")
+    index := 1
+    while (index <= A_Args.Length) {
+        arg := A_Args[index]
+        if (arg = "--silent") {
             runtime["silent"] := true
-        else {
+        } else if (arg = "--metadata-path") {
+            index += 1
+            runtime["metadata_path"] := RequireOptionValue(arg, index)
+        } else if (arg = "--log-path") {
+            index += 1
+            runtime["log_path"] := RequireOptionValue(arg, index)
+        } else if (arg = "--claim-root") {
+            index += 1
+            runtime["claim_root"] := RequireOptionValue(arg, index)
+        } else if (arg = "--matlab-pid") {
+            index += 1
+            runtime["matlab_pid"] := RequireOptionValue(arg, index) + 0
+        } else if (arg = "--worker-id") {
+            index += 1
+            runtime["worker_id"] := RequireOptionValue(arg, index)
+        } else {
             positionalIndex += 1
             if (positionalIndex = 1)
                 runtime["mot_path"] := arg
@@ -449,9 +641,23 @@ ParseRuntimeArgs() {
             else if (positionalIndex = 3)
                 runtime["end_time"] := arg
         }
+        index += 1
     }
 
     return runtime
+}
+
+RequireOptionValue(optionName, index) {
+    if (index > A_Args.Length)
+        throw Error("Missing value for " optionName)
+    return A_Args[index]
+}
+
+EnsureParentDir(path) {
+    fileName := ""
+    SplitPath(path, &fileName, &dirPath)
+    if (dirPath != "" && !DirExist(dirPath))
+        DirCreate(dirPath)
 }
 
 SafeWinTitle(hwnd) {
