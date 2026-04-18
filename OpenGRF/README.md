@@ -50,7 +50,7 @@ This isolation is what makes 5-way parallel runs clean.
 
 - `opengrf_metadata.json`
   - persistent user configuration
-  - contains the source OpenGRF folder, source `.osim`, `.mot` entries, and runtime defaults
+  - contains the source OpenGRF folder, source `.osim`, `.mot` entries, per-activity penetration settings, and runtime defaults
 
 - `opengrf_run_manifest.json`
   - machine-readable run manifest
@@ -64,6 +64,7 @@ This isolation is what makes 5-way parallel runs clean.
 
 If `opengrf_metadata.json` is created from scratch, it now includes these runtime defaults:
 
+- `penetration_by_activity`
 - `max_parallel_sessions`
 - `worker_runtime_root`
 - `analysis_timeout_sec`
@@ -71,7 +72,22 @@ If `opengrf_metadata.json` is created from scratch, it now includes these runtim
 - `retry_count`
 - `matlab_extra_args`
 
-Existing metadata files still work. Missing keys fall back to defaults in the launcher.
+The launcher derives an activity ID from each motion name by taking the part before `_session_<n>`. For example, both `act_1_session_1_processed.mot` and `act_1_session_2_processed.mot` use the `act_1` penetration entry.
+
+Example:
+
+```json
+"penetration_by_activity": {
+  "act_1": 20,
+  "act_2": 20,
+  "act_3": 20,
+  "act_4": 20,
+  "act_5": 20,
+  "act_6": 20
+}
+```
+
+The worker-local metadata written for AutoHotkey still contains a single resolved `penetration` value per staged job. Existing metadata files still work: if `penetration_by_activity` is missing or a specific activity is not listed, the launcher falls back to the legacy top-level `penetration` value.
 
 ## Batch Workflow
 

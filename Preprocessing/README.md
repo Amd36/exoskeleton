@@ -1,117 +1,107 @@
-# Preprocessing Postprocessing
+# Preprocessing Pipeline
 
-This workspace contains a batch postprocessing pipeline for aligning ESP32 sensor recordings with OpenCap `.mot` files, cropping them to the relevant motion window, filtering the piezo channels, and generating review plots plus summary logs.
+This project aligns ESP32 sensor recordings with OpenCap MOT files, crops them to the relevant motion window, filters the piezo channels, and saves review plots plus summary logs.
 
-The current script entrypoint is `preprocessing.py`. Run that script from the workspace root.
+The entrypoint is `preprocessing.py`, and it should be run from the top-level workspace directory.
 
-## What The Script Does
+## Runtime Parent Directory
 
-`preprocessing.py` processes all matched `act_x/session_y` recordings in one run.
+Run the script from the top-level `OpenCapData_<session_id>_<zip_id>/` directory.
 
-For each matched pair, it:
-
-1. Finds the latest ESP32 CSV for the session if duplicates exist.
-2. Drops invalid columns from the ESP32 file:
-   - `adc0_gpio36`
-   - all `imu0_*` columns
-3. Uses only `imu1_*` channels from the ESP32 CSV for alignment.
-4. Uses only lower-body kinematics from the MOT file for alignment:
-   - `pelvis_*`
-   - `hip_*`
-   - `knee_*`
-   - `ankle_*`
-5. Builds activity envelopes from both sides and estimates the best time shift with cross-correlation.
-6. Aligns the pair without changing native sample rates:
-   - ESP32 CSV stays at about `500 Hz`
-   - MOT stays at about `60 Hz`
-7. Builds a crop window from the aligned MOT signal:
-   - ignores the first `1.0 s`
-   - ignores the last `0.1 s`
-   - finds `30%` of the MOT peak within that valid region
-   - keeps `1.0 s` before the first threshold crossing
-   - keeps `1.0 s` after the last threshold crossing
-8. Crops both the sensor CSV and MOT to that final window and rebases time to start at `0.0`.
-9. Applies filtering to the piezo channels only:
-   - low-pass at `100 Hz`
-   - notch at `50 Hz`
-   - notch at `100 Hz`
-10. Saves processed outputs and diagnostic plots.
-
-## Required Input Structure
-
-Before running the script, the workspace root must contain these folders:
+Expected structure before the first run:
 
 ```text
-Preprocessing/
-├─ preprocessing.py
-├─ <participant_name>/
-│  ├─ act_1/
-│  │  ├─ session_1/
-│  │  │  └─ session_1_YYYYMMDD_HHMMSS_all.csv
-│  │  └─ session_2/
-│  ├─ act_2/
-│  └─ ...
-└─ OpenCapData_<session_id>_<zip_id>/
-   └─ OpenCapData_<session_id>/
-      └─ OpenSimData/
-         └─ Kinematics/
-            ├─ act_1_session_1.mot
-            ├─ act_1_session_2.mot
-            └─ ...
+OpenCapData_<session_id>_<zip_id>/
+|-- preprocessing.py
+|-- <subjectID>/
+|   |-- act_1/
+|   |   |-- session_1/
+|   |   |   `-- session_1_YYYYMMDD_HHMMSS_all.csv
+|   |   `-- session_2/
+|   |-- act_2/
+|   `-- ...
+`-- OpenCapData_<session_id>/
+    |-- sessionMetadata.yaml
+    `-- OpenSimData/
+        `-- Kinematics/
+            |-- act_1_session_1.mot
+            |-- act_1_session_2.mot
+            `-- ...
 ```
 
-### Naming Rules
+After processing, the workspace will additionally contain:
 
-- The ESP32 parent folder must match the `subjectID` in:
-  `OpenCapData_<session_id>_<zip_id>/OpenCapData_<session_id>/sessionMetadata.yaml`
-- ESP32 files must live under `<subjectID>/act_x/session_y/`.
-- ESP32 files must end with `_all.csv`.
-- OpenCap MOT files must live under `OpenSimData/Kinematics/`.
-- MOT filenames must match the session key as `act_x_session_y.mot`.
+```text
+OpenCapData_<session_id>_<zip_id>/
+|-- processed_results/
+`-- OpenCapData_<session_id>/
+    `-- OpenSimData/
+        `-- Kinematics/
+            |-- act_1_session_1_processed.mot
+            |-- act_1_session_2_processed.mot
+            |-- original_data/
+            |   |-- act_1_session_1.mot
+            |   |-- act_1_session_2.mot
+            |   `-- ...
+            `-- ...
+```
 
-### Subject Folder Detection
+## How The Script Finds The Sensor Folder
 
-The script does not assume the sensor-data folder is named `Junayed`.
+The script does not hardcode a folder like `Junayed/`.
 
 Instead, it:
 
-1. finds the OpenCap `OpenSimData/Kinematics/` folder
-2. reads `sessionMetadata.yaml`
+1. finds `OpenCapData_<session_id>/OpenSimData/Kinematics/`
+2. reads `OpenCapData_<session_id>/sessionMetadata.yaml`
 3. extracts `subjectID`
-4. looks for the matching sensor-data folder at the workspace root
+4. looks for a folder with that name in the top-level workspace directory
 
 Example:
 
 - if `sessionMetadata.yaml` contains `subjectID: junayed`
-- the script expects the sensor CSVs under `junayed/act_x/session_y/`
-- on case-insensitive filesystems such as Windows, `Junayed/` also works
+- the sensor CSVs must be under `junayed/act_x/session_y/`
+- on Windows, `Junayed/` also works because path matching is case-insensitive
 
-### Duplicate Sensor Files
+## Input Naming Rules
 
-If a session contains more than one ESP32 CSV, the script keeps the latest file based on:
+- Sensor CSVs must live under `<subjectID>/act_x/session_y/`
+- Sensor CSV filenames must end with `_all.csv`
+- Raw MOT inputs must be present directly under:
+  `OpenCapData_<session_id>/OpenSimData/Kinematics/`
+- Each MOT filename must match the session folder naming pattern:
+  `act_x_session_y.mot`
 
-1. timestamp in the filename
-2. file modified time as fallback
+## What The Script Does
 
-## Expected CSV Columns
+For each matched `act_x/session_y` pair, the script:
 
-The script expects the ESP32 CSV to contain:
-
-- `timestamp`
-- `index`
-- piezo channels like `adc1_gpio39`, `adc2_gpio34`, `adc3_gpio35`, `adc4_gpio32`, `adc5_gpio33`
-- IMU channels for `imu1_*`
-
-The script will remove:
-
-- `adc0_gpio36`
-- every `imu0_*` column
+1. chooses the latest sensor CSV if duplicates exist
+2. removes:
+   - `adc0_gpio36`
+   - all `imu0_*` columns
+3. uses only `imu1_*` channels for alignment on the sensor side
+4. uses only `pelvis_*`, `hip_*`, `knee_*`, and `ankle_*` MOT columns for alignment
+5. estimates a time shift with cross-correlation
+6. aligns the two recordings without resampling the saved outputs
+7. crops the aligned MOT-guided window by:
+   - ignoring the first `1.0 s`
+   - ignoring the last `0.1 s`
+   - finding `30%` of the valid-region MOT peak
+   - keeping `1.0 s` before the first threshold crossing
+   - keeping `1.0 s` after the last threshold crossing
+8. crops the sensor CSV to the same final window and rebases both outputs to start at `0.0`
+9. filters the piezo channels only:
+   - low-pass `100 Hz`
+   - notch `50 Hz`
+   - notch `100 Hz`
+10. writes processed files and review plots
+11. moves every original `.mot` file from `Kinematics/` into
+    `OpenCapData_<session_id>/OpenSimData/Kinematics/original_data/`
 
 ## Outputs
 
-After running, outputs are written to two places.
-
-### 1. Processed Sensor CSVs
+### Processed Sensor CSVs
 
 Saved back into each session folder:
 
@@ -120,17 +110,28 @@ Saved back into each session folder:
 ```
 
 Note:
-- The current filename is spelled `_preocessed.csv` because that is what the script currently writes.
 
-### 2. Processed MOT Files
+- the current filename is intentionally `_preocessed.csv` because that is what the script currently writes
 
-Saved into the OpenCap Kinematics folder:
+### Processed MOT Files
+
+Saved into:
 
 ```text
-OpenSimData/Kinematics/<original_name>_processed.mot
+OpenCapData_<session_id>/OpenSimData/Kinematics/<original_name>_processed.mot
 ```
 
-### 3. Review Artifacts
+### Original MOT Archive
+
+Saved into:
+
+```text
+OpenCapData_<session_id>/OpenSimData/Kinematics/original_data/
+```
+
+These are the raw `.mot` files moved out of `Kinematics/` after the script finishes.
+
+### Review Artifacts
 
 Saved into:
 
@@ -141,20 +142,14 @@ processed_results/
 This folder contains:
 
 - `*_alignment.png`
-  - full aligned plot before final crop
-  - shows the `30%` threshold line
 - `*_cropped.png`
-  - final cropped plot
 - `alignment_manifest.csv`
-  - summary of selected inputs, shifts, crop window, outputs, and durations
 - `unmatched_sessions.csv`
-  - sessions that could not be processed
 - `csv_selection_log.csv`
-  - duplicate CSV selection decisions
 
 ## How To Run
 
-From the workspace root:
+From inside the top-level workspace directory:
 
 ```bash
 python preprocessing.py
@@ -168,30 +163,19 @@ python preprocessing.py --help
 
 ## Python Dependencies
 
-The script uses:
-
 - `numpy`
 - `pandas`
 - `matplotlib`
 - `scipy`
 
-## Notes For Users And Agents
+## Quick Sanity Check
 
-- Run the script from the workspace root so relative paths resolve correctly.
-- Do not rename the `act_x/session_y` folders unless you also rename the matching MOT files.
-- If a plot looks suspicious, check `alignment_manifest.csv` first for:
-  - `correlation`
-  - `crop_start_sec`
-  - `crop_end_sec`
-  - output paths
-- The script does not resample the saved files to a common frequency.
-- The alignment uses IMU data only on the sensor side; piezo is filtered after cropping and saved for later analysis.
+Before running:
 
-## Quick Sanity Check Before Running
-
-- the sensor-data folder named by `subjectID` exists at the workspace root
-- OpenCap `OpenSimData/Kinematics/` exists
-- `sessionMetadata.yaml` exists and contains `subjectID`
-- session names match between CSV folders and MOT filenames
-- CSV files still contain `timestamp`
-- Python environment has `numpy`, `pandas`, `matplotlib`, and `scipy`
+- `preprocessing.py` exists in the top-level workspace directory
+- the subject folder named by `subjectID` exists in that same directory
+- `OpenCapData_<session_id>/sessionMetadata.yaml` exists and contains `subjectID`
+- `OpenCapData_<session_id>/OpenSimData/Kinematics/` exists
+- the raw `.mot` files are already inside `OpenCapData_<session_id>/OpenSimData/Kinematics/`
+- session names match between sensor folders and MOT filenames
+- sensor CSVs still contain `timestamp`

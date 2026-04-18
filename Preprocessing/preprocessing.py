@@ -171,8 +171,16 @@ def discover_latest_csvs(sensor_root: Path) -> tuple[dict[str, Path], list[dict[
     return latest, duplicate_rows
 
 
-def discover_pairs(root: Path) -> tuple[list[SessionPair], list[dict[str, str]], list[dict[str, str]]]:
-    kinematics_root = find_kinematics_root(root)
+def resolve_input_mot_path(kinematics_root: Path, act: str, session: str) -> Path | None:
+    candidate = kinematics_root / f"{act}_{session}.mot"
+    if candidate.exists():
+        return candidate
+    return None
+
+
+def discover_pairs(
+    root: Path, kinematics_root: Path
+) -> tuple[list[SessionPair], list[dict[str, str]], list[dict[str, str]]]:
     metadata_path = find_session_metadata_path(kinematics_root)
     subject_id = read_subject_id(metadata_path)
     sensor_root = find_sensor_root(root, subject_id)
@@ -183,8 +191,8 @@ def discover_pairs(root: Path) -> tuple[list[SessionPair], list[dict[str, str]],
 
     for key, csv_path in sorted(latest_csvs.items()):
         act, session = key.split("/")
-        mot_path = kinematics_root / f"{act}_{session}.mot"
-        if not mot_path.exists():
+        mot_path = resolve_input_mot_path(kinematics_root, act, session)
+        if mot_path is None:
             unmatched_rows.append(
                 {
                     "session_key": key,
@@ -205,6 +213,23 @@ def discover_pairs(root: Path) -> tuple[list[SessionPair], list[dict[str, str]],
         )
 
     return pairs, unmatched_rows, duplicate_rows
+
+
+def archive_original_mot_files(kinematics_root: Path) -> tuple[Path, list[Path]]:
+    archive_root = kinematics_root / "original_data"
+    archive_root.mkdir(exist_ok=True)
+
+    archived_paths: list[Path] = []
+    for source_path in sorted(kinematics_root.glob("*.mot")):
+        if not source_path.is_file() or source_path.name.endswith("_processed.mot"):
+            continue
+        destination_path = archive_root / source_path.name
+        if destination_path.exists():
+            destination_path.unlink()
+        source_path.rename(destination_path)
+        archived_paths.append(destination_path)
+
+    return archive_root, archived_paths
 
 
 def load_and_clean_csv(path: Path) -> pd.DataFrame:
@@ -654,10 +679,11 @@ def dataframe_from_rows(rows: list[dict[str, object]], sort_columns: list[str]) 
 def main() -> None:
     args = parse_args()
     root = args.root.resolve()
+    kinematics_root = find_kinematics_root(root)
     postprocessing_root = root / "processed_results"
     postprocessing_root.mkdir(exist_ok=True)
 
-    pairs, unmatched_rows, duplicate_rows = discover_pairs(root)
+    pairs, unmatched_rows, duplicate_rows = discover_pairs(root, kinematics_root)
     manifest_rows: list[dict[str, object]] = []
 
     for pair in pairs:
@@ -853,11 +879,15 @@ def main() -> None:
     duplicate_path = postprocessing_root / "csv_selection_log.csv"
     duplicate_df.to_csv(duplicate_path, index=False)
 
+    archive_root, archived_mot_paths = archive_original_mot_files(kinematics_root)
+
     print(f"Processed matched sessions: {len(manifest_df)}")
     print(f"Unmatched or skipped sessions: {len(unmatched_df)}")
     print(f"Manifest: {manifest_path}")
     print(f"Unmatched log: {unmatched_path}")
     print(f"CSV selection log: {duplicate_path}")
+    print(f"Archived original MOT files: {len(archived_mot_paths)}")
+    print(f"Original MOT archive: {archive_root}")
 
 
 if __name__ == "__main__":

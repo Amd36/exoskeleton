@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 import shutil
 import signal
@@ -34,9 +35,22 @@ DEFAULT_MODEL_DIR = (SCRIPT_DIR / ".." / "OpenSimData" / "Model").resolve()
 
 DEFAULT_WATCH_TIMEOUT_SEC = 120
 DEFAULT_POST_YES_WAIT_MS = 2000
-DEFAULT_PENETRATION = 20
+DEFAULT_PENETRATION = 22
+
+# Edit these values directly before running the launcher.
+# Any non-empty entries here override matching penetration values from metadata.json.
+MANUAL_ACTIVITY_PENETRATIONS = {
+    "act_1": 30,
+    "act_2": 28,
+    "act_3": DEFAULT_PENETRATION,
+    "act_4": DEFAULT_PENETRATION,
+    "act_5": DEFAULT_PENETRATION,
+    "act_6": DEFAULT_PENETRATION,
+}
+
+DEFAULT_ACTIVITY_PENETRATIONS = dict(MANUAL_ACTIVITY_PENETRATIONS)
 DEFAULT_ANALYSIS_TIMEOUT_SEC = 3600
-DEFAULT_MAX_PARALLEL_SESSIONS = 3
+DEFAULT_MAX_PARALLEL_SESSIONS = 5
 DEFAULT_STARTUP_STAGGER_SEC = 3.0
 DEFAULT_RETRY_COUNT = 1
 DEFAULT_MATLAB_EXTRA_ARGS = ["-singleCompThread"]
@@ -46,6 +60,7 @@ DEFAULT_RUNTIME_ROOT = (SCRIPT_DIR / "runtime").resolve()
 @dataclass(frozen=True)
 class MotJob:
     mot_id: str
+    activity_id: str
     mot_path: Path
     base_dir: Path
     abbreviation: str
@@ -102,7 +117,8 @@ class LauncherConfig:
     startup_stagger_sec: float
     retry_count: int
     matlab_extra_args: list[str]
-    penetration: float
+    default_penetration: float
+    penetration_by_activity: dict[str, float]
     estimate_frequency_content: bool
     watch_timeout_sec: int
     post_yes_wait_ms: int
@@ -492,6 +508,12 @@ def build_launcher_config(
         metadata.get("matlab_extra_args"),
         DEFAULT_MATLAB_EXTRA_ARGS,
     )
+    default_penetration = float(metadata.get("penetration", DEFAULT_PENETRATION))
+    penetration_by_activity = normalize_penetration_by_activity(
+        metadata.get("penetration_by_activity"),
+    )
+    manual_penetration_overrides = normalize_penetration_by_activity(MANUAL_ACTIVITY_PENETRATIONS)
+    penetration_by_activity.update(manual_penetration_overrides)
 
     if max_parallel_sessions < 1:
         raise ValueError("max_parallel_sessions must be at least 1")
@@ -516,7 +538,8 @@ def build_launcher_config(
         startup_stagger_sec=startup_stagger_sec,
         retry_count=retry_count,
         matlab_extra_args=matlab_extra_args,
-        penetration=float(metadata.get("penetration", DEFAULT_PENETRATION)),
+        default_penetration=default_penetration,
+        penetration_by_activity=penetration_by_activity,
         estimate_frequency_content=bool(metadata.get("estimate_frequency_content", True)),
         watch_timeout_sec=max(int(metadata.get("watch_timeout_sec", DEFAULT_WATCH_TIMEOUT_SEC)), 10),
         post_yes_wait_ms=max(int(metadata.get("post_yes_wait_ms", DEFAULT_POST_YES_WAIT_MS)), 500),
@@ -545,6 +568,29 @@ def normalize_matlab_extra_args(
             return cleaned
 
     return list(default_value)
+
+
+def normalize_penetration_by_activity(metadata_value: Any) -> dict[str, float]:
+    if metadata_value is None:
+        return {}
+
+    if not isinstance(metadata_value, dict):
+        raise ValueError("penetration_by_activity must be a JSON object mapping activity IDs to numbers")
+
+    cleaned: dict[str, float] = {}
+    for raw_activity_id, raw_penetration in metadata_value.items():
+        activity_id = str(raw_activity_id).strip()
+        if activity_id == "":
+            continue
+
+        try:
+            cleaned[activity_id.casefold()] = float(raw_penetration)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"penetration_by_activity[{activity_id!r}] must be numeric"
+            ) from exc
+
+    return cleaned
 
 
 def validate_environment(config: LauncherConfig, jobs: list[MotJob]) -> None:
@@ -587,6 +633,10 @@ def create_default_metadata() -> dict[str, Any]:
     if not mot_files:
         raise RuntimeError(f"No .mot files found in {DEFAULT_KINEMATICS_DIR}")
 
+    activity_ids = unique_activity_ids(mot_file.stem for mot_file in mot_files)
+    if not activity_ids:
+        activity_ids = list(DEFAULT_ACTIVITY_PENETRATIONS)
+
     return {
         "opengrf_folder": str(DEFAULT_OPENGRF_DIR).replace("\\", "/"),
         "osim": str(osim_path).replace("\\", "/"),
@@ -598,6 +648,10 @@ def create_default_metadata() -> dict[str, Any]:
             for mot_file in mot_files
         ],
         "penetration": DEFAULT_PENETRATION,
+        "penetration_by_activity": {
+            activity_id: DEFAULT_PENETRATION
+            for activity_id in activity_ids
+        },
         "estimate_frequency_content": True,
         "watch_timeout_sec": DEFAULT_WATCH_TIMEOUT_SEC,
         "post_yes_wait_ms": DEFAULT_POST_YES_WAIT_MS,
@@ -637,11 +691,13 @@ def discover_jobs(metadata: dict[str, Any]) -> list[MotJob]:
             mot_id = str(entry.get("mot_id", "")).strip()
             if mot_id == "":
                 continue
+            activity_id = resolve_activity_id(entry.get("activity_id"), mot_id)
             mot_path = base_dir / f"{mot_id}.mot"
             start_time, end_time = extract_time_range(mot_path)
             jobs.append(
                 MotJob(
                     mot_id=mot_id,
+                    activity_id=activity_id,
                     mot_path=mot_path,
                     base_dir=base_dir,
                     abbreviation=abbreviate_mot_id(mot_id),
@@ -659,6 +715,7 @@ def discover_jobs(metadata: dict[str, Any]) -> list[MotJob]:
         jobs.append(
             MotJob(
                 mot_id=mot_file.stem,
+                activity_id=infer_activity_id(mot_file.stem),
                 mot_path=mot_file,
                 base_dir=base_dir,
                 abbreviation=abbreviate_mot_id(mot_file.stem),
@@ -677,6 +734,48 @@ def validate_jobs(jobs: list[MotJob]) -> None:
     missing = [str(job.mot_path) for job in jobs if not job.mot_path.exists()]
     if missing:
         raise FileNotFoundError("Missing .mot files:\n" + "\n".join(missing))
+
+
+def resolve_activity_id(raw_activity_id: Any, mot_id: str) -> str:
+    if raw_activity_id is not None and str(raw_activity_id).strip():
+        return str(raw_activity_id).strip()
+    return infer_activity_id(mot_id)
+
+
+def infer_activity_id(mot_id: str) -> str:
+    cleaned_mot_id = str(mot_id).strip()
+    if cleaned_mot_id == "":
+        raise ValueError("Motion ID cannot be empty when inferring activity ID")
+
+    match = re.match(r"^(.*?)(?:_session_\d+)(?:_.*)?$", cleaned_mot_id, flags=re.IGNORECASE)
+    if match:
+        activity_id = match.group(1).strip("_")
+        if activity_id:
+            return activity_id
+
+    return cleaned_mot_id
+
+
+def unique_activity_ids(mot_ids: Any) -> list[str]:
+    ordered_activity_ids: list[str] = []
+    seen: set[str] = set()
+
+    for mot_id in mot_ids:
+        activity_id = infer_activity_id(str(mot_id))
+        normalized = activity_id.casefold()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered_activity_ids.append(activity_id)
+
+    return ordered_activity_ids
+
+
+def get_job_penetration(config: LauncherConfig, job: MotJob) -> float:
+    return config.penetration_by_activity.get(
+        job.activity_id.casefold(),
+        config.default_penetration,
+    )
 
 
 def prepare_worker_runtimes(config: LauncherConfig) -> list[WorkerRuntime]:
@@ -926,13 +1025,16 @@ def prepare_job_stage(
         if log_path.exists():
             log_path.unlink()
 
+    penetration = get_job_penetration(config, job)
+
     metadata = {
         "opengrf_folder": str(worker.opengrf_dir).replace("\\", "/"),
         "osim": str(staged_osim_path).replace("\\", "/"),
         "mot": str(staged_mot_path).replace("\\", "/"),
+        "activity_id": job.activity_id,
         "start_time": job.start_time,
         "end_time": job.end_time,
-        "penetration": config.penetration,
+        "penetration": penetration,
         "estimate_frequency_content": config.estimate_frequency_content,
         "watch_timeout_sec": config.watch_timeout_sec,
         "post_yes_wait_ms": config.post_yes_wait_ms,
