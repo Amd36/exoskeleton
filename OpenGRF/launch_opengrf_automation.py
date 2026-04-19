@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import shutil
@@ -28,7 +29,11 @@ DEFAULT_AHK_SCRIPT_PATH = SCRIPT_DIR / "run_opengrf_from_json.ahk"
 UNSUCCESSFUL_ANALYSES_PATH = SCRIPT_DIR / "unsuccessful_analyses.txt"
 RUN_MANIFEST_PATH = SCRIPT_DIR / "opengrf_run_manifest.json"
 
-DEFAULT_OPENGRF_DIR = Path(r"C:\Users\Junayed\Documents\OpenSim\OpenGRF_v2")
+if os.path.isdir(r"D:\OpenGRF_v2"):
+    DEFAULT_OPENGRF_DIR = Path(r"D:\OpenGRF_v2")
+else:
+    DEFAULT_OPENGRF_DIR = Path(r"C:\Users\Junayed\Documents\OpenSim\OpenGRF_v2")
+
 DEFAULT_MATLAB_EXE = Path(r"G:\Matlab_R2025a\bin\matlab.exe")
 DEFAULT_KINEMATICS_DIR = (SCRIPT_DIR / ".." / "OpenSimData" / "Kinematics").resolve()
 DEFAULT_MODEL_DIR = (SCRIPT_DIR / ".." / "OpenSimData" / "Model").resolve()
@@ -50,7 +55,12 @@ MANUAL_ACTIVITY_PENETRATIONS = {
 
 DEFAULT_ACTIVITY_PENETRATIONS = dict(MANUAL_ACTIVITY_PENETRATIONS)
 DEFAULT_ANALYSIS_TIMEOUT_SEC = 3600
-DEFAULT_MAX_PARALLEL_SESSIONS = 5
+
+if DEFAULT_OPENGRF_DIR == Path(r"D:\OpenGRF_v2"):
+    DEFAULT_MAX_PARALLEL_SESSIONS = 20
+else:
+    DEFAULT_MAX_PARALLEL_SESSIONS = 5
+
 DEFAULT_STARTUP_STAGGER_SEC = 3.0
 DEFAULT_RETRY_COUNT = 1
 DEFAULT_MATLAB_EXTRA_ARGS = ["-singleCompThread"]

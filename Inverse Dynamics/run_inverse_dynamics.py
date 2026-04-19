@@ -12,8 +12,8 @@ import opensim as osim
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL_DIR = SCRIPT_DIR.parent / "Model"
-DEFAULT_KINEMATICS_DIR = SCRIPT_DIR.parent / "Kinematics"
+DEFAULT_MODEL_DIR = SCRIPT_DIR.parent / "OpenSimData" / "Model"
+DEFAULT_KINEMATICS_DIR = SCRIPT_DIR.parent / "OpenSimData" / "Kinematics"
 DEFAULT_OUTPUT_FILE = "inverse_dynamics.sto"
 DEFAULT_LOWPASS_CUTOFF = 6.0
 LOG_FILE_PATH = SCRIPT_DIR / "inverse_dynamics_log"
